@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EXRay</title>
+    <meta name="description" content="Explore the full dynamic range of HDR OpenEXR images, entirely in your browser." />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' x2='1'%3E%3Cstop offset='0' stop-color='%2330123b'/%3E%3Cstop offset='.35' stop-color='%231ae4b6'/%3E%3Cstop offset='.7' stop-color='%23faba39'/%3E%3Cstop offset='1' stop-color='%237a0403'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='url(%23g)'/%3E%3Cpath d='M9 9l14 14M23 9L9 23' stroke='%23fff' stroke-width='3.5' stroke-linecap='round'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <header class="toolbar">
+      <div class="brand"><span class="logo"></span>EXRay</div>
+      <button id="open" title="Open an EXR file (O)">Open…</button>
+      <input id="file" type="file" accept=".exr,image/x-exr" hidden />
+      <button id="demo" title="Load a synthetic test image">Demo</button>
+      <span id="filename" class="filename"></span>
+      <select id="part" title="Part" hidden></select>
+      <select id="layer" title="Layer / channels" hidden></select>
+      <div class="spacer"></div>
+
+      <div class="group">
+        <div class="seg" id="mode" role="radiogroup" aria-label="Display mode">
+          <button data-v="log" title="Log mapping of the window (1)">Log</button>
+          <button data-v="linear" title="Linear mapping, sRGB-encoded (2)">Linear</button>
+          <button data-v="false" title="False color (3)">False color</button>
+        </div>
+        <select id="colormap" title="Colormap">
+          <option value="turbo">Turbo</option>
+          <option value="viridis">Viridis</option>
+          <option value="inferno">Inferno</option>
+          <option value="gray">Gray</option>
+        </select>
+        <label class="check" title="One color band per stop (B)"><input type="checkbox" id="bands" />Stop bands</label>
+      </div>
+
+      <div class="group">
+        <select id="channel" title="Channel">
+          <option value="rgb">RGB</option>
+          <option value="l">Luminance</option>
+          <option value="r">R</option>
+          <option value="g">G</option>
+          <option value="b">B</option>
+          <option value="a">Alpha</option>
+        </select>
+        <label class="check" title="Mark under / over / NaN / negative values (C)"><input type="checkbox" id="clip" checked />Clipping</label>
+        <label class="check" title="Dim everything outside the window (I)"><input type="checkbox" id="isolate" />Isolate</label>
+      </div>
+      <button id="toggle-info" title="Show file info and statistics">Info</button>
+    </header>
+
+    <main class="workspace">
+      <div class="viewport" id="viewport">
+        <canvas id="image"></canvas>
+        <div class="probe" id="probe" hidden></div>
+        <div class="zoom-label" id="zoom-label"></div>
+        <div class="legend">
+          <span><i style="background: rgb(26 64 255)"></i>under</span>
+          <span><i style="background: rgb(255 26 26)"></i>over</span>
+          <span><i style="background: rgb(255 0 255)"></i>NaN/Inf</span>
+          <span><i style="background: rgb(0 191 179)"></i>negative</span>
+        </div>
+        <div class="empty" id="empty">
+          <h1>EXRay</h1>
+          <p>Explore the full dynamic range of OpenEXR images.<br />Everything runs locally in your browser — nothing is uploaded.</p>
+          <p><button id="empty-open">Open an EXR…</button> <button id="empty-demo">Try the demo image</button></p>
+          <p class="muted">or drop a file anywhere</p>
+          <p class="muted"><a href="https://github.com/soswow/EXRay">Source on GitHub</a> · GPL-3.0</p>
+        </div>
+        <div class="busy" id="busy" hidden><span class="spinner"></span><span id="busy-text">Decoding…</span></div>
+        <div class="error" id="error" hidden></div>
+      </div>
+      <aside class="info" id="info" hidden></aside>
+    </main>
+
+    <section class="hist" id="hist-panel">
+      <div class="hist-resize" id="hist-resize" title="Drag to resize"></div>
+      <div class="hist-controls">
+        <div class="seg small" id="yscale" aria-label="Histogram Y scale">
+          <button data-v="linear">Lin</button>
+          <button data-v="sqrt">Sqrt</button>
+          <button data-v="log">Log</button>
+        </div>
+        <div class="chan-toggles" id="hist-channels">
+          <button data-v="L" class="kL">L</button>
+          <button data-v="R" class="kR">R</button>
+          <button data-v="G" class="kG">G</button>
+          <button data-v="B" class="kB">B</button>
+        </div>
+        <div class="window-inputs">
+          <label>Window <input id="win-lo" type="number" step="0.25" /> … <input id="win-hi" type="number" step="0.25" /> EV</label>
+          <button id="win-auto" title="Fit window to the 0.5–99.9% luminance percentiles (A)">Auto</button>
+          <button id="win-full" title="Window covers all positive values">Full</button>
+        </div>
+        <button id="hist-fit" title="Zoom histogram to data (H, or double-click)">Fit view</button>
+        <div class="spacer"></div>
+        <div class="hint">wheel: zoom · drag: pan · drag top bar or shift-drag: set window · drag edges: adjust</div>
+      </div>
+      <canvas id="hist-overview" class="hist-overview"></canvas>
+      <div class="hist-main">
+        <canvas id="hist"></canvas>
+        <div class="tooltip" id="hist-tip" hidden></div>
+      </div>
+    </section>
+
+    <div class="drop" id="drop" hidden><div>Drop EXR to open</div></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

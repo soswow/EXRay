@@ -1,0 +1,6 @@
+node_modules
+dist
+.DS_Store
+# local symlink to sample images, not part of the repo
+samples
+.claude/settings.local.json
