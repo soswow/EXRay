@@ -230,6 +230,7 @@ export function parseExrLayout(buffer: ArrayBuffer): ExrFileLayout {
       dataWindow: (v.get('dataWindow') as [number, number, number, number]) ?? [0, 0, 0, 0],
       displayWindow: (v.get('displayWindow') as [number, number, number, number]) ?? [0, 0, 0, 0],
       tiled: type ? type.startsWith('tiled') : tiled && !deep,
+      tiles: v.get('tiles') as ExrPart['tiles'],
       deep: type ? type.startsWith('deep') : deep,
       chromaticities: v.get('chromaticities') as number[] | undefined,
       attributes: p.attrs,

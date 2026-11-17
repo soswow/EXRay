@@ -59,6 +59,8 @@ export interface ExrPart {
   dataWindow: [number, number, number, number];
   displayWindow: [number, number, number, number];
   tiled: boolean;
+  /** Tile size and level mode (0 one level, 1 mipmap, 2 ripmap) for tiled parts. */
+  tiles?: { x: number; y: number; mode: number };
   deep: boolean;
   /** [rx, ry, gx, gy, bx, by, wx, wy] */
   chromaticities?: number[];

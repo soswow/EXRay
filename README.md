@@ -49,13 +49,21 @@ In the image, the wheel zooms, dragging pans, and double-clicking fits. In the h
 
 ## How it works
 
-- **Decoding**: three.js `EXRLoader`, which is pure JS and supports NONE, RLE, ZIPS, ZIP, PIZ, PXR24, B44/B44A and DWAA/DWAB. It runs in a worker. EXRLoader only understands R/G/B/A/Y channel names. To view other layers, EXRay rewrites the channel list in a copy of the header and shifts the chunk offset tables.
+- **Decoding** runs in a worker.
+  - NONE, RLE, ZIPS and ZIP files use EXRay's own decoder. It handles any channel names, mixed HALF/FLOAT/UINT channels, and tiled files including mip/ripmaps (top level only). ZIP chunks are inflated by the browser's native `DecompressionStream`.
+  - PIZ, PXR24, B44/B44A and DWAA/DWAB use three.js `EXRLoader`. EXRLoader only understands R/G/B/A/Y channel names, so to view other layers EXRay rewrites the channel list in a copy of the header and shifts the chunk offset tables.
 - **Histogram**: built from float bit patterns. The exponent gives the stop, and a mantissa lookup table gives the fraction, so no `log2` is needed per pixel. Prefix sums make any zoom level O(1) per screen column.
 - **Display**: a single fragment shader reads the RGBA32F texture with `texelFetch`, so values are exact and unfiltered.
 
 ## Known limitations / roadmap
 
-- RIPMAP tiled files, deep images (partially), HTJ2K compression, and subsampled chroma outside B44 are not decoded yet. The next step is likely a WASM build of the OpenEXR core library.
+- Not decoded yet:
+  - deep images (partially)
+  - HTJ2K compression
+  - subsampled chroma outside B44
+  - with PIZ, PXR24, B44 or DWA compression: RIPMAP tiles, and channels of mixed pixel types
+
+  The next step is likely a WASM build of the OpenEXR core library.
 - No gamut conversion: non-Rec.709 primaries are shown as raw RGB. OCIO-style display transforms are planned.
 - Images larger than the GPU's max texture size (often 16384 px) aren't tiled yet.
 - When zoomed out, display uses nearest sampling (no min/max-preserving mipmaps yet).

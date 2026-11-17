@@ -1,6 +1,7 @@
 import { FloatType } from 'three';
 import { EXRLoader } from 'three/examples/jsm/loaders/EXRLoader.js';
-import { lumaWeights, parseExrLayout, remapLayer } from './exr-header';
+import { lumaWeights, parseExrLayout, pixelTypeName, remapLayer } from './exr-header';
+import { canDecodeNatively, decodeNative } from './exr-decode';
 import { HistogramAccumulator } from './histogram';
 import { makeDemoImage } from './demo';
 import type { ChannelHistogram, ChannelKey, DecodedImage, ExrPart, WorkerRequest, WorkerResponse } from './types';
@@ -11,10 +12,10 @@ const ctx = self as unknown as {
   onmessage: ((e: MessageEvent<WorkerRequest>) => void) | null;
 };
 
-ctx.onmessage = (e) => {
+ctx.onmessage = async (e) => {
   try {
     const req = e.data;
-    const image = req.type === 'demo' ? demo() : decode(req.buffer, req.name, req.part, req.layer);
+    const image = req.type === 'demo' ? demo() : await decode(req.buffer, req.name, req.part, req.layer);
     const transfer: Transferable[] = [image.data.buffer];
     for (const k of Object.keys(image.histograms) as ChannelKey[]) transfer.push(image.histograms[k].bins.buffer);
     ctx.postMessage({ type: 'result', image }, transfer);
@@ -23,7 +24,7 @@ ctx.onmessage = (e) => {
   }
 };
 
-function decode(buffer: ArrayBuffer, name: string, part: number, layerId?: string): DecodedImage {
+async function decode(buffer: ArrayBuffer, name: string, part: number, layerId?: string): Promise<DecodedImage> {
   const layout = parseExrLayout(buffer);
   const parts = layout.parts;
   const header: ExrPart | undefined = parts[part];
@@ -45,15 +46,27 @@ function decode(buffer: ArrayBuffer, name: string, part: number, layerId?: strin
   const luminanceOnly = !targets.has('R') && !targets.has('RY');
 
   const t0 = performance.now();
-  const loader = new EXRLoader();
-  loader.setDataType(FloatType);
-  loader.setPart(part);
-  const tex = loader.parse(remapLayer(buffer, layout, part, layer));
+  let data: Float32Array, width: number, height: number;
+  if (canDecodeNatively(header, layer)) {
+    ({ data, width, height } = await decodeNative(buffer, layout, part, layer));
+  } else {
+    // EXRLoader reads every channel with one pixel type and treats UINT as 0 bytes wide.
+    const types = new Set(header.channels.map((c) => c.pixelType));
+    if (types.size > 1 || types.has(0)) {
+      throw new Error(
+        `Channels with mixed pixel types (${[...types].map(pixelTypeName).join(', ')}) ` +
+          `in ${header.compression} files aren't supported by the decoder yet`,
+      );
+    }
+    const loader = new EXRLoader();
+    loader.setDataType(FloatType);
+    loader.setPart(part);
+    const tex = loader.parse(remapLayer(buffer, layout, part, layer));
+    data = tex.data as unknown as Float32Array;
+    width = tex.width as number;
+    height = tex.height as number;
+  }
   const t1 = performance.now();
-
-  const data = tex.data as unknown as Float32Array;
-  const width = tex.width as number;
-  const height = tex.height as number;
   const weights = lumaWeights(header.chromaticities);
   const histograms = buildHistograms(data, width * height, weights);
   const t2 = performance.now();
