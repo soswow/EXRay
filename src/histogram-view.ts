@@ -26,6 +26,16 @@ const CHANNEL_STYLE: Record<ChannelKey, { stroke: string; fill: string }> = {
   B: { stroke: 'rgba(100,150,255,0.95)', fill: 'rgba(100,150,255,0.2)' },
 };
 
+/** A labeled vertical line on the histogram, e.g. a RAW white level or noise floor. */
+export interface HistMarker {
+  /** log2 of the value. */
+  ev: number;
+  label: string;
+  color: string;
+  /** Longer explanation for the tooltip. */
+  title?: string;
+}
+
 type Drag =
   | { kind: 'pan'; startX: number; v0: number; v1: number }
   | { kind: 'lo' | 'hi' }
@@ -42,6 +52,9 @@ export class HistogramView {
   private cum: Partial<Record<ChannelKey, Float64Array>> = {};
   private stats: Partial<Record<ChannelKey, ChannelStats>> = {};
   private total = 0;
+  /** Values per channel; RAW photosite channels have fewer values than pixels. */
+  private totals: Partial<Record<ChannelKey, number>> = {};
+  markers: HistMarker[] = [];
   private extent: [number, number] = [-10, 10];
 
   /** Visible EV range of the main histogram. */
@@ -75,6 +88,8 @@ export class HistogramView {
       const h = img.histograms[k];
       this.cum[k] = cumulative(h.bins);
       this.stats[k] = h.stats;
+      const t = h.stats.pos + h.stats.zero + h.stats.neg + h.stats.nan + h.stats.inf;
+      this.totals[k] = t || this.total;
       if (h.stats.pos) {
         lo = Math.min(lo, Math.log2(h.stats.minPos));
         hi = Math.max(hi, Math.log2(h.stats.maxPos));
@@ -405,7 +420,8 @@ export class HistogramView {
       for (let c = 0; c < cols; c++) {
         const e0 = this.v0 + (c / cols) * (this.v1 - this.v0);
         const e1 = this.v0 + ((c + 1) / cols) * (this.v1 - this.v0);
-        arr[c] = this.density(cum, e0, e1);
+        // Each channel as a share of its own values, so photosite channels compare fairly.
+        arr[c] = this.density(cum, e0, e1) * (this.total / this.totals[k]!);
         if (arr[c] > max) max = arr[c];
       }
       dens[k] = arr;
@@ -443,6 +459,29 @@ export class HistogramView {
       g.lineTo(x, plotBottom);
       g.stroke();
     }
+
+    // Reference markers (RAW white level, noise floor, ...).
+    g.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+    g.textBaseline = 'top';
+    let labelRow = 0;
+    for (const m of [...this.markers].sort((a, b) => a.ev - b.ev)) {
+      const x = Math.round(this.xAt(m.ev)) + 0.5;
+      if (x < 0 || x > w) continue;
+      g.strokeStyle = m.color;
+      g.lineWidth = 1;
+      g.setLineDash([2, 3]);
+      g.beginPath();
+      g.moveTo(x, plotTop);
+      g.lineTo(x, plotBottom);
+      g.stroke();
+      g.setLineDash([]);
+      g.fillStyle = m.color;
+      const tw = g.measureText(m.label).width;
+      const right = x + 3 + tw > w;
+      g.textAlign = right ? 'right' : 'left';
+      g.fillText(m.label, right ? x - 3 : x + 3, plotTop + 18 + 12 * (labelRow++ % 3));
+    }
+    g.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
 
     // Probe markers: where the hovered image pixel sits.
     if (this.probe) {
@@ -583,10 +622,13 @@ export class HistogramView {
     for (const k of ['L', 'R', 'G', 'B'] as ChannelKey[]) {
       if (!this.channels.has(k)) continue;
       const cum = this.cum[k]!;
-      const perStop = (this.density(cum, ev - half, ev + half) * BINS_PER_STOP / this.total) * 100;
-      const below = (cumAt(cum, evToBin(ev)) + this.stats[k]!.zero + this.stats[k]!.neg) / this.total * 100;
+      const total = this.totals[k]!;
+      const perStop = (this.density(cum, ev - half, ev + half) * BINS_PER_STOP / total) * 100;
+      const below = (cumAt(cum, evToBin(ev)) + this.stats[k]!.zero + this.stats[k]!.neg) / total * 100;
       lines.push(`<span class="k k${k}">${k}</span> ${perStop.toPrecision(3)}%/stop · ${below.toFixed(2)}% below`);
     }
+    const near = this.markers.filter((m) => Math.abs(this.xAt(m.ev) - x) <= 4);
+    for (const m of near) lines.push(`<span style="color:${m.color}">${m.title ?? m.label}</span>`);
     tip.innerHTML = lines.join('<br>');
     tip.hidden = false;
     const r = this.main.getBoundingClientRect();

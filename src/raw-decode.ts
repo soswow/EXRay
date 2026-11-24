@@ -7,7 +7,7 @@
  */
 import wasmUrl from '@colorhythm/libraw-wasm/libraw.wasm?url';
 import type { LibRaw as LibRawClass } from '@colorhythm/libraw-wasm';
-import { HistogramAccumulator } from './histogram';
+import { demosaic, lcm, maskedNoise, minimalPeriod, orientCell, orientPixels, patternName, photositeHist, type MaskedNoise } from './raw-process';
 import type { ChannelHistogram, ExrAttribute, RawImage, RawModeId } from './types';
 
 type LibRawModule = typeof import('@colorhythm/libraw-wasm');
@@ -45,6 +45,7 @@ interface Unpacked {
   model: string;
   attributes: ExrAttribute[];
   notes: string[];
+  noise: MaskedNoise | null;
 }
 
 let cache: Unpacked | null = null;
@@ -143,19 +144,17 @@ function read(lr: LibRawClass, key: string): Unpacked {
   if (linearMax) attr('Linear max', linearMax);
   attr('As-shot WB', mul.map((m) => m.toFixed(3)).join(' / '));
   attr('rgb_cam', [0, 1, 2].map((i) => rgbCam.slice(i * 3, i * 3 + 3).map((v) => v.toFixed(3)).join(' ')).join('  |  '));
-  attr('Flip', lr.getFlip());
+  const flip = lr.getFlip();
+  if (flip) attr('Orientation', { 3: 'rotated 180°', 5: 'rotated 90° CCW', 6: 'rotated 90° CW' }[flip] ?? `flip ${flip}`);
 
-  const common = { key, width, height, linearMax, wb, rgbCam, make, model, attributes, notes };
+  const common = { key, linearMax, wb, rgbCam, make, model, attributes, notes };
+  const rotated = flip === 5 || flip === 6;
 
   const raw = filters && !ip.is_foveon ? lr.getRawImage() : null;
   const oddLayout = width > rawW - left || height > rawH - top || left < 0 || top < 0;
   const fourColor = ip.colors === 4 && ip.cdesc !== 'RGBG';
 
   if (raw && !oddLayout && !fourColor) {
-    // Mosaic: crop the visible area out of the full sensor readout.
-    const dn = new Uint16Array(width * height);
-    for (let y = 0; y < height; y++) dn.set(raw.subarray((y + top) * rawW + left, (y + top) * rawW + left + width), y * width);
-
     // The repeating cell must cover both the color pattern and any black-level pattern.
     const [pw, ph] = filters === 9 ? [6, 6] : filters < 1000 ? [16, 16] : [2, 8];
     const cw = lcm(pw, cblack[4] || 1), ch = lcm(ph, cblack[5] || 1);
@@ -164,9 +163,7 @@ function read(lr: LibRawClass, key: string): Unpacked {
       const pat = cblack[4] && cblack[5] ? lr.getCblack(6 + (y % cblack[4]) * cblack[5] + (x % cblack[5])) : 0;
       return black + cblack[Math.min(c, 3)] + pat;
     };
-    const colors: number[] = [];
-    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) colors.push(lr.color(y, x));
-    const { w: cellW, h: cellH } = minimalPeriod(colors, cw, ch, blackAt);
+    const { w: cellW, h: cellH } = minimalPeriod(cw, ch, (x, y) => `${lr.color(y, x)}:${blackAt(x, y)}`);
     const cellColor: number[] = [], cellBlack: number[] = [];
     for (let y = 0; y < cellH; y++) {
       for (let x = 0; x < cellW; x++) {
@@ -174,17 +171,30 @@ function read(lr: LibRawClass, key: string): Unpacked {
         cellBlack.push(blackAt(x, y));
       }
     }
+
+    // Read noise from the masked border, before it is cropped away.
+    const cellIndex = (x: number, y: number) => (((y % cellH) + cellH) % cellH) * cellW + (((x % cellW) + cellW) % cellW);
+    const noise = maskedNoise(raw, rawW, rawH, left, top, cellIndex, cellBlack);
+
+    // Crop the visible area out of the full sensor readout, then apply the orientation.
+    let dn = new Uint16Array(width * height);
+    for (let y = 0; y < height; y++) dn.set(raw.subarray((y + top) * rawW + left, (y + top) * rawW + left + width), y * width);
+    dn = orientPixels(dn, width, height, 1, flip);
+    const oc = orientCell(cellColor.map((c, i) => [c, cellBlack[i]] as const), cellW, cellH, width, height, flip);
     return {
       ...common,
+      width: rotated ? height : width,
+      height: rotated ? width : height,
       kind: 'cfa',
       channels: 1,
       dn,
-      cellW,
-      cellH,
-      cellColor,
-      cellBlack,
+      cellW: oc.cw,
+      cellH: oc.ch,
+      cellColor: oc.cell.map((c) => c[0]),
+      cellBlack: oc.cell.map((c) => c[1]),
       white: maximum,
-      pattern: patternName(cellColor, cellW, cellH, filters),
+      pattern: patternName(cellColor, cellW, cellH, filters === 9),
+      noise,
     };
   }
 
@@ -192,7 +202,7 @@ function read(lr: LibRawClass, key: string): Unpacked {
   const c4 = lr.getColor4Image(), c3 = c4 ? null : lr.getColor3Image();
   if ((c4 || c3) && !oddLayout) {
     const src = (c4 ?? c3)!, n = c4 ? 4 : 3;
-    const dn = new Uint16Array(width * height * 3);
+    let dn = new Uint16Array(width * height * 3);
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const s = ((y + top) * rawW + x + left) * n, d = (y * width + x) * 3;
@@ -201,9 +211,12 @@ function read(lr: LibRawClass, key: string): Unpacked {
         dn[d + 2] = src[s + 2];
       }
     }
+    dn = orientPixels(dn, width, height, 3, flip);
     notes.push(ip.is_foveon ? 'Foveon sensor: three values per pixel, no mosaic.' : 'This file stores already demosaiced (linear) RGB, so there is no mosaic to show.');
     return {
       ...common,
+      width: rotated ? height : width,
+      height: rotated ? width : height,
       kind: 'linear',
       channels: 3,
       dn,
@@ -213,10 +226,12 @@ function read(lr: LibRawClass, key: string): Unpacked {
       cellBlack: [0, 1, 2].map((c) => lr.getBlackLevel(c)),
       white: maximum,
       pattern: ip.is_foveon ? 'Foveon' : 'linear RGB',
+      noise: null,
     };
   }
 
   // Unusual layouts (e.g. Fuji SuperCCD): let LibRaw develop to linear 16-bit camera RGB.
+  // LibRaw also applies the orientation here.
   for (let i = 0; i < 4; i++) lr.setUserMul(i, 1);
   lr.setOutputColor(0);
   lr.setOutputBps(16);
@@ -249,48 +264,8 @@ function read(lr: LibRawClass, key: string): Unpacked {
     white: 65535,
     linearMax: 0,
     pattern: 'demosaiced by LibRaw',
+    noise: null,
   };
-}
-
-function gcd(a: number, b: number): number {
-  return b ? gcd(b, a % b) : a;
-}
-const lcm = (a: number, b: number) => (a / gcd(a, b)) * b;
-
-/** Smallest cell (dividing cw × ch) that repeats both the color pattern and the black pattern. */
-function minimalPeriod(
-  colors: number[],
-  cw: number,
-  ch: number,
-  blackAt: (x: number, y: number) => number,
-): { w: number; h: number } {
-  const ok = (w: number, h: number) => {
-    for (let y = 0; y < ch; y++) {
-      for (let x = 0; x < cw; x++) {
-        if (colors[y * cw + x] !== colors[(y % h) * cw + (x % w)]) return false;
-        if (blackAt(x, y) !== blackAt(x % w, y % h)) return false;
-      }
-    }
-    return true;
-  };
-  let bw = cw, bh = ch;
-  for (let w = 1; w <= cw; w++) {
-    if (cw % w) continue;
-    for (let h = 1; h <= ch; h++) {
-      if (ch % h || w * h >= bw * bh) continue;
-      if (ok(w, h)) {
-        bw = w;
-        bh = h;
-      }
-    }
-  }
-  return { w: bw, h: bh };
-}
-
-function patternName(colors: number[], w: number, h: number, filters: number): string {
-  if (filters === 9) return 'X-Trans';
-  if (w === 2 && h === 2) return colors.map((c) => 'RGBG'[c]).join('');
-  return `${w}×${h} CFA`;
 }
 
 // ---------- developing ----------
@@ -310,19 +285,19 @@ function develop(u: Unpacked, mode: RawModeId): RawDecoded {
   let photositeHistograms: RawDecoded['photositeHistograms'];
 
   if (u.kind === 'cfa') {
-    // Normalized photosite plane, top-down.
-    const norm = new Float32Array(W * H);
+    // Normalized photosites go into the alpha lane (rows top-down), so no extra plane is needed.
     const { cellW: cw, cellH: ch } = u;
     for (let y = 0; y < H; y++) {
       const row = y * W, cy = (y % ch) * cw;
       for (let x = 0; x < W; x++) {
         const c = cy + (x % cw);
-        norm[row + x] = (u.dn[row + x] - u.cellBlack[c]) * cellScale[c];
+        data[(row + x) * 4 + 3] = (u.dn[row + x] - u.cellBlack[c]) * cellScale[c];
       }
     }
     const site = u.cellColor.map((c) => (c === 3 ? 1 : c));
-    demosaic(norm, W, H, site, cw, ch, data);
-    if (mode !== '709') photositeHistograms = photositeHist(norm, W, H, site, cw, ch);
+    if (mode !== '709') photositeHistograms = photositeHist(data, 4, 3, W, H, site, cw, ch);
+    demosaic(data, 4, 3, W, H, site, cw, ch, data);
+    for (let i = 3; i < data.length; i += 4) data[i] = 1;
   } else {
     for (let y = 0; y < H; y++) {
       const out = (H - 1 - y) * W * 4;
@@ -371,97 +346,8 @@ function develop(u: Unpacked, mode: RawModeId): RawDecoded {
       model: u.model,
       attributes: u.attributes,
       notes,
+      noise: u.noise,
       timings: { unpackMs: 0, developMs: 0 },
     },
   };
-}
-
-/**
- * Generic bilinear-style demosaic that works for any CFA: each missing color is the mean of the
- * same-colored photosites in the 3×3 neighborhood (5×5 if there are none). For Bayer this is
- * exactly bilinear interpolation. Output is RGBA, rows bottom-up.
- */
-export function demosaic(norm: Float32Array, W: number, H: number, site: number[], cw: number, ch: number, out: Float32Array) {
-  // Per cell and color: the neighbor offsets to average.
-  const offsets: { dx: number[]; dy: number[]; idx: Int32Array }[] = [];
-  for (let cy = 0; cy < ch; cy++) {
-    for (let cx = 0; cx < cw; cx++) {
-      for (let k = 0; k < 3; k++) {
-        const dx: number[] = [], dy: number[] = [];
-        if (site[cy * cw + cx] === k) {
-          dx.push(0);
-          dy.push(0);
-        } else {
-          for (let r = 1; r <= 2 && !dx.length; r++) {
-            for (let oy = -r; oy <= r; oy++) {
-              for (let ox = -r; ox <= r; ox++) {
-                const sx = (((cx + ox) % cw) + cw) % cw, sy = (((cy + oy) % ch) + ch) % ch;
-                if (site[sy * cw + sx] === k) {
-                  dx.push(ox);
-                  dy.push(oy);
-                }
-              }
-            }
-          }
-        }
-        offsets.push({ dx, dy, idx: Int32Array.from(dx.map((x, i) => dy[i] * W + x)) });
-      }
-    }
-  }
-
-  for (let y = 0; y < H; y++) {
-    const outRow = (H - 1 - y) * W * 4, cy = (y % ch) * cw;
-    const yInner = y >= 2 && y < H - 2;
-    for (let x = 0; x < W; x++) {
-      const p = y * W + x, o = outRow + x * 4, cell = (cy + (x % cw)) * 3;
-      if (yInner && x >= 2 && x < W - 2) {
-        for (let k = 0; k < 3; k++) {
-          const idx = offsets[cell + k].idx, n = idx.length;
-          if (n === 1) {
-            out[o + k] = norm[p + idx[0]];
-          } else {
-            let s = 0;
-            for (let j = 0; j < n; j++) s += norm[p + idx[j]];
-            out[o + k] = s / n;
-          }
-        }
-      } else {
-        for (let k = 0; k < 3; k++) {
-          const { dx, dy } = offsets[cell + k];
-          let s = 0, n = 0;
-          for (let j = 0; j < dx.length; j++) {
-            const xx = x + dx[j], yy = y + dy[j];
-            if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
-            s += norm[yy * W + xx];
-            n++;
-          }
-          out[o + k] = n ? s / n : 0;
-        }
-      }
-      out[o + 3] = 1;
-    }
-  }
-}
-
-/** R/G/B histograms over the photosites of each color, without interpolated values. */
-function photositeHist(norm: Float32Array, W: number, H: number, site: number[], cw: number, ch: number) {
-  const acc = [new HistogramAccumulator(), new HistogramAccumulator(), new HistogramAccumulator()];
-  const CHUNK = 1 << 16;
-  const bufs = [0, 1, 2].map(() => new Float32Array(CHUNK));
-  const bits = bufs.map((b) => new Uint32Array(b.buffer));
-  const fill = [0, 0, 0];
-  const flush = (k: number) => {
-    acc[k].add(bufs[k], bits[k], 0, 1, fill[k]);
-    fill[k] = 0;
-  };
-  for (let y = 0; y < H; y++) {
-    const row = y * W, cy = (y % ch) * cw;
-    for (let x = 0; x < W; x++) {
-      const k = site[cy + (x % cw)];
-      bufs[k][fill[k]++] = norm[row + x];
-      if (fill[k] === CHUNK) flush(k);
-    }
-  }
-  for (let k = 0; k < 3; k++) flush(k);
-  return { R: acc[0].result(), G: acc[1].result(), B: acc[2].result() };
 }

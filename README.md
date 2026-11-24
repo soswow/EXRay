@@ -23,6 +23,9 @@ Explore the full dynamic range of HDR OpenEXR images — entirely in the browser
   - Zoom in (or press `M`) to see the **mosaic**: every photosite in its own color with its true value, no interpolation. Zoomed out, a bilinear demosaic is shown.
   - The pixel probe shows the raw integer (DN), the black level, and the value relative to the white level.
   - Three ways to turn sensor values into RGB: camera RGB, white-balanced camera RGB, or linear Rec.709 through the camera matrix. R/G/B histograms count real photosites only.
+  - The histogram marks the white level, the camera's linear maximum, 1 DN above black (where values become coarse integers) and the read-noise floor.
+  - Read noise is measured from the sensor's masked (optical black) border when the file includes one, giving the engineering dynamic range: white ÷ read noise, in stops.
+  - Any CFA pattern works (Bayer, X-Trans, …), including per-position black levels. Images are rotated per the file's orientation. Linear DNG, sRAW and Foveon files are shown as three-channel data, and unusual layouts such as Fuji SuperCCD fall back to LibRaw's own demosaic.
 
 ## Usage
 
@@ -70,6 +73,7 @@ In the image, the wheel zooms, dragging pans, and double-clicking fits. In the h
   - with PIZ, PXR24, B44 or DWA compression: RIPMAP tiles, and channels of mixed pixel types
 
   The next step is likely a WASM build of the OpenEXR core library.
+- RAW: the demosaic is plain bilinear, there is no highlight reconstruction, and the decoded image takes 16 bytes per pixel (about 400 MB for 24 MP).
 - No gamut conversion: non-Rec.709 primaries are shown as raw RGB. OCIO-style display transforms are planned.
 - Images larger than the GPU's max texture size (often 16384 px) aren't tiled yet.
 - When zoomed out, display uses nearest sampling (no min/max-preserving mipmaps yet).

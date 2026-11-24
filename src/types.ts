@@ -133,6 +133,8 @@ export interface RawImage {
   /** EXIF-like metadata for the info panel. */
   attributes: ExrAttribute[];
   notes: string[];
+  /** Read noise estimated from the sensor's masked border, when the file includes one. */
+  noise: { sigma: number; offset: number; pixels: number; region: string } | null;
   /** LibRaw unpack (0 when reused from the previous decode) and our own processing. */
   timings: { unpackMs: number; developMs: number };
 }

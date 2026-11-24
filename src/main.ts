@@ -4,7 +4,7 @@ import type { DisplayMode, DisplayParams, ViewChannel } from './display';
 import { pixelTypeName } from './exr-header';
 import { fmtBytes, fmtEv, fmtValue, escapeHtml } from './format';
 import { percentileEv } from './histogram';
-import { HistogramView, type YScale } from './histogram-view';
+import { HistogramView, type HistMarker, type YScale } from './histogram-view';
 import { Renderer } from './renderer';
 import { RAW_MODES, type ChannelKey, type DecodedImage, type RawImage, type WorkerRequest, type WorkerResponse } from './types';
 
@@ -63,7 +63,8 @@ const hist = new HistogramView($<HTMLCanvasElement>('hist'), $<HTMLCanvasElement
 });
 hist.display = params;
 
-const worker = new Worker(new URL('./decode.worker.ts', import.meta.url), { type: 'module' });
+const makeWorker = () => new Worker(new URL('./decode.worker.ts', import.meta.url), { type: 'module' });
+let worker = makeWorker();
 
 // ---------- rendering ----------
 
@@ -124,6 +125,12 @@ function decodeInWorker(req: WorkerRequest, transfer: Transferable[] = []): Prom
 
 async function load(name: string, getBuffer: () => Promise<ArrayBuffer>, part = 0, layer?: string, keepView = false) {
   showError(null);
+  if (!keepView && image?.raw && image.byteSize > 80 * 2 ** 20) {
+    // LibRaw's WebAssembly memory never shrinks. After a very large file, a fresh worker gives
+    // it back (at the cost of compiling LibRaw again, so it isn't done after every file).
+    worker.terminate();
+    worker = makeWorker();
+  }
   setBusy(`Reading ${name}…`);
   try {
     const buffer = await getBuffer();
@@ -195,6 +202,7 @@ function setImage(img: DecodedImage, keepView: boolean) {
   layerSel.value = img.layer;
   if (img.luminanceOnly && params.channel !== 'rgb' && params.channel !== 'l') params.channel = 'rgb';
 
+  hist.markers = img.raw ? rawMarkers(img.raw) : [];
   hist.setImage(img);
   if (!keepView || first) {
     autoWindow();
@@ -367,6 +375,36 @@ function rawProbe(probe: HTMLElement, raw: RawImage, x: number, y: number, R: nu
   hist.setProbe({ R, G, B, L });
 }
 
+/** Black level of the green channel (the one white balance leaves alone). */
+function greenBlack(raw: RawImage) {
+  const i = raw.cellColor.findIndex((c) => c === 1 || c === 3);
+  return raw.cellBlack[Math.max(0, i)];
+}
+
+/** Read-noise numbers for a RAW file, when the masked border allows an estimate. */
+function rawNoise(raw: RawImage) {
+  if (!raw.noise) return null;
+  // Dynamic range runs up to where the sensor stops being linear, when the file says where that is.
+  const top = raw.linearMax && raw.linearMax < raw.white ? raw.linearMax : raw.white;
+  const range = raw.white - greenBlack(raw);
+  return { sigma: raw.noise.sigma, norm: raw.noise.sigma / range, dr: Math.log2((top - greenBlack(raw)) / raw.noise.sigma), top };
+}
+
+/** Sensor reference levels on the histogram, in the normalized (green) scale. */
+function rawMarkers(raw: RawImage): HistMarker[] {
+  const range = raw.white - greenBlack(raw);
+  const m: HistMarker[] = [{ ev: 0, label: 'white', color: '#ff6b6b', title: `White level: ${raw.white} DN (${raw.bits}-bit)` }];
+  if (raw.linearMax && raw.linearMax < raw.white) {
+    m.push({ ev: Math.log2((raw.linearMax - greenBlack(raw)) / range), label: 'linear max', color: '#ffa94d', title: `Linear max: ${raw.linearMax} DN, the highest value the camera calls linear` });
+  }
+  if (raw.pattern !== 'demosaiced by LibRaw') {
+    m.push({ ev: Math.log2(1 / range), label: '1 DN', color: '#74c0fc', title: 'One raw step above black: below this, values are quantized to single integers' });
+  }
+  const n = rawNoise(raw);
+  if (n) m.push({ ev: Math.log2(n.norm), label: 'read noise σ', color: '#b197fc', title: `Read noise ${n.sigma.toFixed(2)} DN from masked pixels: SNR 1 here, ${n.dr.toFixed(2)} stops below ${n.top === raw.white ? 'white' : 'linear max'}` });
+  return m;
+}
+
 /** Per-cell RGBA table for the mosaic shader: color index, black level, scale. */
 function mosaicTable(width: number, height: number, raw: RawImage) {
   const cell = new Float32Array(raw.cellW * raw.cellH * 4);
@@ -420,6 +458,17 @@ function renderInfo() {
       ['Normalized', '1.0 = white level, after black subtraction'],
       ...raw.attributes.map((a): [string, string] => [a.name, a.display]),
     ];
+    const n = rawNoise(raw);
+    if (raw.noise && n) {
+      rawInfo.splice(3, 0,
+        ['Read noise', `σ ${n.sigma.toFixed(2)} DN (${raw.noise.region} masked, ${raw.noise.pixels.toLocaleString()} px)`],
+        ['Engineering DR', `${n.dr.toFixed(2)} stops (${n.top === raw.white ? 'white' : 'linear max'} ÷ read noise)`],
+      );
+      if (Math.abs(raw.noise.offset) >= 1) rawInfo.splice(5, 0, ['Masked offset', `${raw.noise.offset > 0 ? '+' : ''}${raw.noise.offset.toFixed(1)} DN vs. declared black`]);
+    } else if (raw.kind === 'cfa') {
+      rawInfo.splice(3, 0, ['Read noise', 'no masked border in this file']);
+    }
+    if (raw.pattern !== 'demosaiced by LibRaw') rawInfo.splice(3, 0, ['Quantization', `${Math.log2(raw.white - greenBlack(raw)).toFixed(2)} stops from 1 DN to white`]);
     rows.push('<h2>RAW</h2>', dl(rawInfo));
     for (const n of raw.notes) rows.push(`<p class="note">${escapeHtml(n)}</p>`);
     if (raw.kind === 'cfa' && raw.mode !== '709') rows.push('<p class="note">R/G/B statistics and histograms count photosites only; luminance uses the demosaiced image.</p>');
