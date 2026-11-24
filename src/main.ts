@@ -2,7 +2,7 @@ import './style.css';
 import { colormapLut, type ColormapId } from './colormaps';
 import { clampWindow, type DisplayMode, type DisplayParams, type ViewChannel } from './display';
 import { pixelTypeName } from './exr-header';
-import { fmtBytes, fmtDn, fmtLevel, fmtLinear, fmtRange, fmtValue, escapeHtml, fromStops, gridCeil, gridFloor, inputToLevel, levelToInput, setRawReadout, SHOW_STOPS } from './format';
+import { fmtBytes, fmtLevel, fmtLinear, fmtRange, fmtValue, escapeHtml, fromStops, gridCeil, gridFloor, inputToLevel, levelToInput, rawReadout, setRawReadout, SHOW_STOPS } from './format';
 import { percentileEv } from './histogram';
 import { HistogramView, type HistMarker, type YScale } from './histogram-view';
 import { Renderer } from './renderer';
@@ -351,7 +351,7 @@ function rawProbe(probe: HTMLElement, raw: RawImage, x: number, y: number, R: nu
   // Fixed-width columns: label, DN, ratio. The header uses the same widths.
   const cols = (label: string, dn: string, ratio: string) => [label.padEnd(2), dn.padStart(8), ratio.padStart(9)];
   const row = (label: string, cls: string, dn: string, v: number, mark = '') => {
-    const [l, d, r] = cols(label, dn, fmtValue(v));
+    const [l, d, r] = cols(label, dn, Number.isFinite(v) ? v.toFixed(5) : fmtValue(v));
     return `<span class="k${cls}">${l}</span> ${d} ${r}${mark}`;
   };
   const header = (dnLabel: string) => `<span class="ev">${cols('', dnLabel, 'ratio').join(' ')}</span>`;
@@ -372,10 +372,11 @@ function rawProbe(probe: HTMLElement, raw: RawImage, x: number, y: number, R: nu
   [R, G, B].forEach((v, c) => {
     // The photosite's own channel is the exact raw integer; the others are interpolated.
     const exact = c === siteChannel && !approx;
-    const dn = exact ? String(raw.dn[y * w + x]) : raw.kind === 'linear' && !approx ? String(raw.dn[(y * w + x) * 3 + c]) : fmtDn(toDn(c, v));
-    lines.push(row(names[c], names[c], dn, v, exact ? ' <span class="ev">•</span>' : ''));
+    const dn = exact ? raw.dn[y * w + x] : raw.kind === 'linear' && !approx ? raw.dn[(y * w + x) * 3 + c] : toDn(c, v);
+    lines.push(row(names[c], names[c], dn.toFixed(1), v, exact ? ' <span class="ev">•</span>' : ''));
   });
-  lines.push(row('L', 'L', fmtLinear(L), L));
+  const scale = rawReadout()!;
+  lines.push(row('L', 'L', (scale.black + L * scale.range).toFixed(1), L));
   probe.innerHTML = lines.join('\n');
   probe.hidden = false;
   hist.setProbe({ R, G, B, L });
