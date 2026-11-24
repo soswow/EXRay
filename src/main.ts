@@ -269,7 +269,10 @@ function setImage(img: DecodedImage, keepView: boolean) {
   layerSel.hidden = layers.length < 2;
   layerSel.innerHTML = layers.map((l) => `<option value="${escapeHtml(l.id)}">${escapeHtml(l.label)}</option>`).join('');
   layerSel.value = img.layer;
-  if (img.luminanceOnly && params.channel !== 'rgb' && params.channel !== 'l') params.channel = 'rgb';
+  // Offer only the channels the image has. RAW never has alpha (its alpha lane holds photosites).
+  const offered = (c: ViewChannel) => (c === 'a' ? img.hasAlpha : !img.luminanceOnly || c === 'rgb' || c === 'l');
+  for (const opt of channelSel.options) opt.hidden = opt.disabled = !offered(opt.value as ViewChannel);
+  if (!offered(params.channel)) params.channel = 'rgb';
 
   // RAW axis and window positions read out as green DN, on the green channel's black and white level.
   setRawReadout(img.raw ? greenLevels(img.raw) : null);
