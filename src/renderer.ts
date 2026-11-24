@@ -1,4 +1,5 @@
 import { CLIP_COLORS, type DisplayParams } from './display';
+import { GRID_ORIGIN } from './format';
 
 const VERT = /* glsl */ `#version 300 es
 void main() {
@@ -18,14 +19,16 @@ uniform vec2 u_size;       // image size in px
 uniform vec2 u_offset;     // device px of the image's top-left corner on the canvas
 uniform float u_scale;     // device px per image px
 uniform float u_canvasH;
-uniform float u_lo, u_hi;  // window, EV
+uniform float u_lo, u_hi;  // window, log2 of value
 uniform int u_mode;        // 0 log, 1 linear, 2 false color
 uniform int u_channel;     // 0 rgb, 1 r, 2 g, 3 b, 4 luminance, 5 alpha
 uniform bool u_clip, u_isolate, u_bands;
-uniform vec2 u_hover;      // EV range highlighted from the histogram; x > y means off
+uniform vec2 u_hover;      // log2 range highlighted from the histogram; x > y means off
 uniform vec3 u_weights;
 
 uniform vec3 c_under, c_over, c_nan, c_neg, c_hover;
+
+const float GRID_ORIGIN = ${GRID_ORIGIN.toFixed(9)}; // log2 where bands start (see format.ts)
 
 out vec4 outColor;
 
@@ -44,7 +47,7 @@ float windowT(float v) {
   }
   if (v <= 0.0) return -1.0;
   float ev = log2(v);
-  if (u_mode == 2 && u_bands) ev = floor(ev) + 0.5;
+  if (u_mode == 2 && u_bands) ev = floor(ev - GRID_ORIGIN) + 0.5 + GRID_ORIGIN;
   return (ev - u_lo) / (u_hi - u_lo);
 }
 

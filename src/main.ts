@@ -1,8 +1,8 @@
 import './style.css';
 import { colormapLut, type ColormapId } from './colormaps';
-import type { DisplayMode, DisplayParams, ViewChannel } from './display';
+import { clampWindow, type DisplayMode, type DisplayParams, type ViewChannel } from './display';
 import { pixelTypeName } from './exr-header';
-import { fmtBytes, fmtEv, fmtValue, escapeHtml } from './format';
+import { fmtBytes, fmtLevel, fmtRange, fmtValue, escapeHtml, fromStops, gridCeil, gridFloor, inputToLevel, levelToInput, SHOW_STOPS } from './format';
 import { percentileEv } from './histogram';
 import { HistogramView, type YScale } from './histogram-view';
 import { Renderer } from './renderer';
@@ -15,8 +15,8 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getEleme
 const params: DisplayParams = {
   mode: 'log',
   channel: 'rgb',
-  lo: -8,
-  hi: 4,
+  lo: SHOW_STOPS ? fromStops(-6) : -8,
+  hi: SHOW_STOPS ? fromStops(6) : 4,
   colormap: 'turbo',
   bands: false,
   clip: true,
@@ -189,12 +189,19 @@ function setImage(img: DecodedImage, keepView: boolean) {
   if (!keepView || first) {
     autoWindow();
     fitImage();
+  } else {
+    setWindow(params.lo, params.hi, true); // the new layer may have a different range
   }
   renderInfo();
   requestRender();
 }
 
 // ---------- window ----------
+
+/** Sets the display window, kept inside the image's data range. */
+function setWindow(lo: number, hi: number, keepSpan = false) {
+  [params.lo, params.hi] = clampWindow(lo, hi, hist.dataRange(), keepSpan);
+}
 
 function autoWindow() {
   const cum = hist.cumFor('L');
@@ -205,24 +212,16 @@ function autoWindow() {
     lo -= 0.5;
     hi += 0.5;
   }
-  params.lo = Math.floor(lo * 4) / 4;
-  params.hi = Math.ceil(hi * 4) / 4;
+  setWindow(gridFloor(lo, 4), gridCeil(hi, 4));
   syncControls();
   requestRender();
 }
 
+/** Window covers exactly the smallest to the largest positive value in any channel. */
 function fullWindow() {
-  if (!image) return;
-  let lo = Infinity, hi = -Infinity;
-  for (const k of ['R', 'G', 'B', 'L'] as ChannelKey[]) {
-    const s = image.histograms[k].stats;
-    if (!s.pos) continue;
-    lo = Math.min(lo, Math.log2(s.minPos));
-    hi = Math.max(hi, Math.log2(s.maxPos));
-  }
-  if (!Number.isFinite(lo)) return;
-  params.lo = Math.floor(lo);
-  params.hi = Math.ceil(hi + 1e-6);
+  const range = hist.dataRange();
+  if (!image || !range) return;
+  setWindow(range[0], range[1]);
   syncControls();
   requestRender();
 }
@@ -302,9 +301,7 @@ function updateProbe(e: PointerEvent) {
   const [R, G, B, A] = [d[i], d[i + 1], d[i + 2], d[i + 3]];
   const w = image.lumaWeights;
   const L = w[0] * R + w[1] * G + w[2] * B;
-  const ev = (v: number) => (v > 0 && Number.isFinite(v) ? fmtEv(Math.log2(v), 2).padStart(7) : '      ·');
-  const row = (k: string, v: number) =>
-    `<span class="k${k}">${k}</span> ${fmtValue(v).padStart(10)}  <span class="ev">${ev(v)} EV</span>`;
+  const row = (k: string, v: number) => `<span class="k${k}">${k}</span> ${fmtValue(v).padStart(10)}`;
   const lines = [`x ${x}  y ${y}`];
   if (image.luminanceOnly) lines.push(row('L', R));
   else lines.push(row('R', R), row('G', G), row('B', B), row('L', L));
@@ -355,14 +352,15 @@ function renderInfo() {
   const drPairs: [string, string][] = [];
   if (L.pos) {
     const lo = Math.log2(L.minPos), hi = Math.log2(L.maxPos);
-    drPairs.push(['Full', `${(hi - lo).toFixed(2)} stops (${fmtEv(lo)} … ${fmtEv(hi)})`]);
+    drPairs.push(['Full', fmtRange(lo, hi)]);
     for (const [a, b] of [[0.001, 0.999], [0.01, 0.99]]) {
       const pa = percentileEv(cum, a), pb = percentileEv(cum, b);
-      drPairs.push([`${a * 100}–${b * 100}%`, `${(pb - pa).toFixed(2)} stops (${fmtEv(pa)} … ${fmtEv(pb)})`]);
+      drPairs.push([`${a * 100}–${b * 100}%`, fmtRange(pa, pb)]);
     }
-    drPairs.push(['Median', `${fmtEv(percentileEv(cum, 0.5))} EV`]);
+    drPairs.push(['Median', fmtLevel(percentileEv(cum, 0.5))]);
   }
   rows.push('<h2>Luminance dynamic range</h2>', drPairs.length ? dl(drPairs) : '<p class="note">No positive values.</p>');
+  if (SHOW_STOPS && drPairs.length) rows.push('<p class="note">Stops are relative to 0.18 middle grey.</p>');
 
   // Per-channel stats.
   const keys: ChannelKey[] = img.luminanceOnly ? ['L'] : ['R', 'G', 'B', 'L'];
@@ -444,15 +442,31 @@ for (const id of ['bands', 'clip', 'isolate'] as const) {
 
 const winLo = $<HTMLInputElement>('win-lo'), winHi = $<HTMLInputElement>('win-hi');
 const onWinInput = () => {
-  const lo = parseFloat(winLo.value), hi = parseFloat(winHi.value);
+  const lo = inputToLevel(parseFloat(winLo.value)), hi = inputToLevel(parseFloat(winHi.value));
   if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) {
-    params.lo = lo;
-    params.hi = hi;
+    setWindow(lo, hi);
     requestRender();
   }
 };
+if (!SHOW_STOPS) {
+  // Window inputs take linear values; bands are per power of two.
+  $('win-unit').hidden = true;
+  $('win-label').removeAttribute('title');
+  for (const el of [winLo, winHi]) {
+    el.step = 'any';
+    el.classList.add('no-spin');
+  }
+  $('bands-text').textContent = 'Bands';
+  $('bands-text').parentElement!.title = 'One color band per power of two (B)';
+}
 winLo.addEventListener('input', onWinInput);
 winHi.addEventListener('input', onWinInput);
+// On commit, show the window as it actually is (typed values may have been clamped).
+for (const [el, side] of [[winLo, 'lo'], [winHi, 'hi']] as const) {
+  const show = () => (el.value = levelToInput(params[side]));
+  el.addEventListener('change', show);
+  el.addEventListener('keydown', (e) => e.key === 'Enter' && show());
+}
 $('win-auto').addEventListener('click', autoWindow);
 $('win-full').addEventListener('click', fullWindow);
 $('hist-fit').addEventListener('click', () => hist.fitView());
@@ -472,8 +486,8 @@ function syncControls() {
   $<HTMLInputElement>('clip').checked = params.clip;
   $<HTMLInputElement>('isolate').checked = params.isolate;
   channelSel.value = params.channel;
-  if (document.activeElement !== winLo) winLo.value = params.lo.toFixed(2);
-  if (document.activeElement !== winHi) winHi.value = params.hi.toFixed(2);
+  if (document.activeElement !== winLo) winLo.value = levelToInput(params.lo);
+  if (document.activeElement !== winHi) winHi.value = levelToInput(params.hi);
   document.querySelector('.legend')!.classList.toggle('off', !params.clip);
 }
 
@@ -549,8 +563,8 @@ window.addEventListener('keydown', (e) => {
     h: () => hist.fitView(),
     o: openPicker,
     '0': () => image && zoomAt(viewport.clientWidth / 2, viewport.clientHeight / 2, 1 / (window.devicePixelRatio || 1)),
-    '[': () => { params.lo -= 0.5; params.hi -= 0.5; },
-    ']': () => { params.lo += 0.5; params.hi += 0.5; },
+    '[': () => setWindow(params.lo - 0.5, params.hi - 0.5, true),
+    ']': () => setWindow(params.lo + 0.5, params.hi + 0.5, true),
   };
   const fn = actions[e.key];
   if (!fn) return;

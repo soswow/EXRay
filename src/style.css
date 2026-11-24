@@ -97,7 +97,6 @@ input[type='checkbox'] { height: auto; accent-color: var(--accent); margin: 0 5p
 }
 .probe { left: 10px; bottom: 10px; padding: 6px 10px; white-space: pre; }
 .probe .kR { color: #ff7a7a; } .probe .kG { color: #7ae68a; } .probe .kB { color: #85a8ff; } .probe .kL { color: #eee; } .probe .kA { color: #aaa; }
-.probe .ev { color: var(--accent); }
 .zoom-label { right: 10px; bottom: 10px; padding: 3px 8px; color: var(--muted); }
 .legend { right: 10px; top: 10px; padding: 4px 8px; display: flex; gap: 10px; color: var(--muted); font-family: var(--sans); }
 .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
@@ -191,7 +190,15 @@ input[type='checkbox'] { height: auto; accent-color: var(--accent); margin: 0 5p
 .chan-toggles button[aria-pressed='true'].kG { background: #5ae66e; color: #111; }
 .chan-toggles button[aria-pressed='true'].kB { background: #6496ff; color: #111; }
 .window-inputs { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
-.window-inputs input { height: 24px; }
+.window-inputs input { height: 24px; width: calc(10ch + 34px); }
+/* Grow with the number (e.g. 0.002194, 1.401e-45) where the browser supports it. */
+@supports (field-sizing: content) {
+  .window-inputs input { width: auto; field-sizing: content; min-width: calc(5ch + 34px); }
+}
+/* Value mode: a ±1 spinner is meaningless for 0.002194, so hide it. */
+.window-inputs input.no-spin { appearance: textfield; -moz-appearance: textfield; }
+.window-inputs input.no-spin::-webkit-inner-spin-button,
+.window-inputs input.no-spin::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 .window-inputs button, #hist-fit { height: 24px; padding: 2px 8px; font-size: 12px; }
 .hint { color: var(--muted); font-size: 12px; }
 .hist-overview, .hist-main canvas { display: block; width: 100%; height: 100%; }

@@ -6,14 +6,14 @@ Explore the full dynamic range of HDR OpenEXR images — entirely in the browser
 
 ## Features
 
-- **Zoomable log₂ histogram.** The x-axis is in stops (EV) and spans the whole float32 range, denormals included, at 1/64-stop resolution. It pans and zooms like a timeline, and an overview strip shows the full data extent. The Y scale can be linear, sqrt or log, with L/R/G/B curves.
-- **Display window.** Drag the edges, drag the bar to move it, or shift-drag to select a new one. The window maps to the screen as:
+- **Zoomable log₂ histogram.** The x-axis is log₂ (labelled with linear values) and spans the whole float32 range, denormals included, at 1/64-stop resolution. It pans and zooms like a timeline, and an overview strip shows the full data extent. The Y scale can be linear, sqrt or log, with L/R/G/B curves.
+- **Display window.** Drag the edges, drag the bar to move it, or shift-drag to select a new one. It stays within the image's smallest and largest positive values. The window maps to the screen as:
   - **Log**: linear in stops, so any range fits on screen
   - **Linear**: exposure plus black point, sRGB-encoded
   - **False color**: Turbo, Viridis, Inferno or Gray, optionally in one band per stop
 - **Two-way linking.** Hovering the histogram highlights those pixels in the image. Hovering the image marks the pixel's R/G/B/L on the histogram.
 - **Clipping and special values.** Under-window, over-window, NaN/Inf and negative values are marked in distinct colors. *Isolate* dims everything outside the window.
-- **Pixel probe.** Shows raw float values and EV.
+- **Pixel probe.** Shows the raw float values under the cursor.
 - **Stats.** Dynamic range (full, 0.1–99.9 %, 1–99 %), per-channel min/max, and counts of zero, negative, NaN and Inf values.
 - **Multi-part files and layers/AOVs.** For example `diffuse.RGB`, `Z`, or `disparityL.x`.
 - **Color-accurate luminance.** Luminance weights come from the file's `chromaticities`.
