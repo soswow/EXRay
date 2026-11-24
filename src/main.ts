@@ -1,5 +1,5 @@
 import './style.css';
-import { colormapLut, type ColormapId } from './colormaps';
+import { COLORMAPS, colormapLut, type ColormapId } from './colormaps';
 import { clampWindow, TRANSFERS, type DisplayMode, type DisplayParams, type Transfer, type ViewChannel } from './display';
 import { pixelTypeName } from './exr-header';
 import { fmtBytes, fmtLevel, fmtLinear, fmtRange, fmtValue, escapeHtml, fromStops, gridCeil, gridFloor, inputToLevel, levelToInput, setRawReadout, SHOW_STOPS } from './format';
@@ -10,18 +10,35 @@ import { RAW_MODES, type ChannelKey, type DecodedImage, type LevelCandidate, typ
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
+// ---------- saved settings ----------
+
+/** The choices the user makes in the UI, kept in localStorage so they survive a reload. */
+const SETTINGS_KEY = 'exray:settings';
+const saved: Record<string, unknown> = (() => {
+  try {
+    const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}');
+    return s && typeof s === 'object' ? s : {};
+  } catch {
+    return {};
+  }
+})();
+const oneOf = <T extends string>(values: readonly T[]) => (v: unknown): v is T => values.includes(v as T);
+const isBool = (v: unknown): v is boolean => typeof v === 'boolean';
+/** The saved value for `key` if it is still a valid choice, else `fallback`. */
+const pick = <T,>(key: string, ok: (v: unknown) => v is T, fallback: T): T => (ok(saved[key]) ? saved[key] : fallback);
+
 // ---------- state ----------
 
 const params: DisplayParams = {
-  mode: 'log',
-  channel: 'rgb',
+  mode: pick('mode', oneOf<DisplayMode>(['log', 'linear', 'false']), 'log'),
+  channel: pick('channel', oneOf<ViewChannel>(['rgb', 'l', 'r', 'g', 'b', 'a']), 'rgb'),
   lo: SHOW_STOPS ? fromStops(-6) : -8,
   hi: SHOW_STOPS ? fromStops(6) : 4,
-  colormap: 'turbo',
-  transfer: 'srgb',
-  bands: false,
-  clip: true,
-  isolate: false,
+  colormap: pick('colormap', oneOf(Object.keys(COLORMAPS) as ColormapId[]), 'turbo'),
+  transfer: pick('transfer', oneOf(TRANSFERS.map((t) => t.id)), 'srgb'),
+  bands: pick('bands', isBool, false),
+  clip: pick('clip', isBool, true),
+  isolate: pick('isolate', isBool, false),
 };
 
 let image: DecodedImage | null = null;
@@ -34,7 +51,7 @@ const view = { scale: 1, x: 0, y: 0 };
 let hover: [number, number] | null = null;
 /** RAW sensor view: the mosaic of photosites, the demosaiced image, or the mosaic once zoomed in. */
 type SensorView = 'auto' | 'demosaic' | 'mosaic';
-let sensorView: SensorView = 'auto';
+let sensorView: SensorView = pick('sensor', oneOf<SensorView>(['auto', 'mosaic', 'demosaic']), 'auto');
 /** CSS px per photosite at which 'auto' switches to the mosaic. */
 const MOSAIC_ZOOM = 4;
 const mosaicShown = () => !!image?.raw && image.raw.kind === 'cfa' && (sensorView === 'mosaic' || (sensorView === 'auto' && view.scale >= MOSAIC_ZOOM));
@@ -65,6 +82,41 @@ const hist = new HistogramView($<HTMLCanvasElement>('hist'), $<HTMLCanvasElement
   },
 });
 hist.display = params;
+hist.yScale = pick('histY', oneOf<YScale>(['linear', 'sqrt', 'log']), hist.yScale);
+hist.setXScale(pick('histX', oneOf<XScale>(['log', 'linear', 'sqrt']), hist.xScale));
+const savedChannels = pick('histChannels', (v): v is ChannelKey[] => Array.isArray(v) && v.length > 0 && v.every(oneOf<ChannelKey>(['L', 'R', 'G', 'B'])), null);
+if (savedChannels) hist.channels = new Set(savedChannels);
+$('info').hidden = !pick('info', isBool, false);
+const savedHistH = pick('histHeight', (v): v is number => typeof v === 'number' && Number.isFinite(v), null);
+if (savedHistH) document.body.style.setProperty('--hist-h', `${Math.min(window.innerHeight * 0.8, Math.max(140, savedHistH))}px`);
+
+let savedJson = JSON.stringify(saved);
+function saveSettings() {
+  const histH = parseFloat(document.body.style.getPropertyValue('--hist-h'));
+  const json = JSON.stringify({
+    mode: params.mode,
+    channel: params.channel,
+    colormap: params.colormap,
+    transfer: params.transfer,
+    bands: params.bands,
+    clip: params.clip,
+    isolate: params.isolate,
+    sensor: sensorView,
+    histX: hist.xScale,
+    histY: hist.yScale,
+    histChannels: [...hist.channels],
+    info: !$('info').hidden,
+    histHeight: Number.isFinite(histH) ? histH : undefined,
+  });
+  if (json === savedJson) return;
+  savedJson = json;
+  try {
+    localStorage.setItem(SETTINGS_KEY, json);
+  } catch {
+    // Storage full or blocked: settings just won't persist.
+  }
+}
+window.addEventListener('pagehide', saveSettings);
 
 const makeWorker = () => new Worker(new URL('./decode.worker.ts', import.meta.url), { type: 'module' });
 let worker = makeWorker();
@@ -78,6 +130,7 @@ function requestRender() {
   frame = requestAnimationFrame(() => {
     frame = 0;
     render();
+    saveSettings();
   });
 }
 
@@ -686,7 +739,7 @@ histChannels.addEventListener('click', (e) => {
   if (hist.channels.has(k) && hist.channels.size > 1) hist.channels.delete(k);
   else hist.channels.add(k);
   syncControls();
-  hist.redraw();
+  requestRender();
 });
 
 const transferSel = $<HTMLSelectElement>('transfer');
@@ -762,6 +815,7 @@ function syncControls() {
     b.setAttribute('aria-pressed', String(hist.channels.has(b.dataset.v as ChannelKey))),
   );
   colormapSel.hidden = params.mode !== 'false';
+  colormapSel.value = params.colormap;
   transferSel.hidden = params.mode !== 'linear';
   transferSel.value = params.transfer;
   $('bands').parentElement!.hidden = params.mode !== 'false';
@@ -825,6 +879,7 @@ $('hist-resize').addEventListener('pointerdown', (e) => {
     document.body.style.setProperty('--hist-h', `${h}px`);
   };
   const up = () => {
+    saveSettings();
     el.removeEventListener('pointermove', move);
     el.removeEventListener('pointerup', up);
   };
