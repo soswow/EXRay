@@ -47,7 +47,7 @@ For local testing, symlink a folder of EXRs as `samples/` in the project root (i
 | --- | --- |
 | `1` `2` `3` | Log / Linear / False color |
 | `C` / `I` / `B` | Clipping / Isolate / Stop bands |
-| `A` | Auto window (0.5–99.9 % luminance; RAW: exactly 1–99 %) |
+| `A` | Auto window (0.5–99.9 % luminance; RAW: exactly 0.05–99.99 %) |
 | `[` `]` | Shift window by ½ stop |
 | `F` / `0` | Fit image / 1:1 pixels |
 | `H` | Fit histogram (press again to show everything) |
