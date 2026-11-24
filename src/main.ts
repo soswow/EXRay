@@ -6,7 +6,7 @@ import { fmtBytes, fmtLevel, fmtLinear, fmtRange, fmtValue, escapeHtml, fromStop
 import { percentileEv } from './histogram';
 import { HistogramView, type HistMarker, type XScale, type YScale } from './histogram-view';
 import { Renderer } from './renderer';
-import { RAW_MODES, type ChannelKey, type DecodedImage, type LevelCandidate, type RawImage, type RawOptions, type WorkerRequest, type WorkerResponse } from './types';
+import { RAW_MODES, type ChannelKey, type RawModeId, type DecodedImage, type LevelCandidate, type RawImage, type RawOptions, type WorkerRequest, type WorkerResponse } from './types';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -54,6 +54,11 @@ type SensorView = 'auto' | 'demosaic' | 'mosaic';
 let sensorView: SensorView = pick('sensor', oneOf<SensorView>(['auto', 'mosaic', 'demosaic']), 'auto');
 /** CSS px per photosite at which 'auto' switches to the mosaic. */
 const MOSAIC_ZOOM = 4;
+/** RAW: the mode a newly opened RAW file is decoded in (the last one picked). */
+let rawMode: RawModeId = pick('rawMode', oneOf(RAW_MODES.map((m) => m.id)), 'cam');
+/** How a newly opened image's window is set: the last of Auto / Full that was pressed. */
+type WindowFit = 'auto' | 'full';
+let windowFit: WindowFit = pick('windowFit', oneOf<WindowFit>(['auto', 'full']), 'auto');
 const mosaicShown = () => !!image?.raw && image.raw.kind === 'cfa' && (sensorView === 'mosaic' || (sensorView === 'auto' && view.scale >= MOSAIC_ZOOM));
 
 // ---------- components ----------
@@ -102,6 +107,8 @@ function saveSettings() {
     clip: params.clip,
     isolate: params.isolate,
     sensor: sensorView,
+    rawMode,
+    windowFit,
     histX: hist.xScale,
     histY: hist.yScale,
     histChannels: [...hist.channels],
@@ -217,7 +224,7 @@ async function loadDemo() {
 }
 
 function loadFile(file: File) {
-  load(file.name, () => file.arrayBuffer());
+  load(file.name, () => file.arrayBuffer(), 0, rawMode);
 }
 
 function loadUrl(url: string) {
@@ -226,7 +233,7 @@ function loadUrl(url: string) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.arrayBuffer();
-  });
+  }, 0, rawMode);
 }
 
 function setImage(img: DecodedImage, keepView: boolean) {
@@ -254,7 +261,10 @@ function setImage(img: DecodedImage, keepView: boolean) {
   const layers = img.raw ? RAW_MODES : img.parts[img.part]?.layers ?? [];
   $('sensor').hidden = img.raw?.kind !== 'cfa';
   $('layer-label').hidden = !img.raw;
-  if (img.raw) rawOptions = { ...img.raw.options };
+  if (img.raw) {
+    rawOptions = { ...img.raw.options };
+    rawMode = img.layer as RawModeId;
+  }
   const layerSel = $<HTMLSelectElement>('layer');
   layerSel.hidden = layers.length < 2;
   layerSel.innerHTML = layers.map((l) => `<option value="${escapeHtml(l.id)}">${escapeHtml(l.label)}</option>`).join('');
@@ -267,7 +277,8 @@ function setImage(img: DecodedImage, keepView: boolean) {
   $('win-auto').title = `Fit window to the ${img.raw ? '0.001–99.999' : '0.5–99.9'}% luminance percentiles (A)`;
   hist.setImage(img);
   if (!keepView || first) {
-    autoWindow();
+    if (windowFit === 'full') fullWindow();
+    else autoWindow();
     fitImage();
   } else {
     setWindow(params.lo, params.hi, true); // the new layer may have a different range
@@ -800,8 +811,14 @@ for (const [el, side] of [[winLo, 'lo'], [winHi, 'hi']] as const) {
   el.addEventListener('change', show);
   el.addEventListener('keydown', (e) => e.key === 'Enter' && show());
 }
-$('win-auto').addEventListener('click', autoWindow);
-$('win-full').addEventListener('click', fullWindow);
+$('win-auto').addEventListener('click', () => {
+  windowFit = 'auto';
+  autoWindow();
+});
+$('win-full').addEventListener('click', () => {
+  windowFit = 'full';
+  fullWindow();
+});
 $('hist-fit').addEventListener('click', () => hist.fitView());
 
 $('part').addEventListener('change', (e) => reload?.(parseInt((e.target as HTMLSelectElement).value, 10)));
@@ -897,7 +914,10 @@ window.addEventListener('keydown', (e) => {
     c: () => (params.clip = !params.clip),
     i: () => (params.isolate = !params.isolate),
     b: () => (params.bands = !params.bands),
-    a: autoWindow,
+    a: () => {
+      windowFit = 'auto';
+      autoWindow();
+    },
     f: fitImage,
     h: () => hist.fitView(),
     o: openPicker,
