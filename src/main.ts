@@ -324,13 +324,19 @@ function updateProbe(e: PointerEvent) {
   const raw = image.raw;
   if (raw) return rawProbe(probe, raw, x, y, R, G, B, L);
   const row = (k: string, v: number) => `<span class="k${k}">${k}</span> ${fmtValue(v).padStart(10)}`;
-  const lines = [`x ${x}  y ${y}`];
+  const lines = [coordLine(x, y)];
   if (image.luminanceOnly) lines.push(row('L', R));
   else lines.push(row('R', R), row('G', G), row('B', B), row('L', L));
   if (image.hasAlpha) lines.push(row('A', A));
   probe.innerHTML = lines.join('\n');
   probe.hidden = false;
   hist.setProbe(image.luminanceOnly ? { L: R } : { R, G, B, L });
+}
+
+/** "x 12  y 345", padded to the image's widest coordinates so the line never shifts. */
+function coordLine(x: number, y: number) {
+  const img = image!;
+  return `x ${String(x).padStart(String(img.width - 1).length)}  y ${String(y).padStart(String(img.height - 1).length)}`;
 }
 
 function rawProbe(probe: HTMLElement, raw: RawImage, x: number, y: number, R: number, G: number, B: number, L: number) {
@@ -357,7 +363,7 @@ function rawProbe(probe: HTMLElement, raw: RawImage, x: number, y: number, R: nu
   const header = (dnLabel: string) => `<span class="ev">${cols('', dnLabel, 'ratio').join(' ')}</span>`;
 
   const mosaic = mosaicShown() && cell >= 0;
-  const lines = [`x ${x}  y ${y}`];
+  const lines = [coordLine(x, y)];
   if (mosaic) {
     const dn = raw.dn[y * w + x];
     const v = (dn - raw.cellBlack[cell]) * raw.cellScale[cell];
