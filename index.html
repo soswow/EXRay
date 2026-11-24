@@ -35,7 +35,7 @@
           <option value="inferno">Inferno</option>
           <option value="gray">Gray</option>
         </select>
-        <label class="check" title="One color band per stop (B)"><input type="checkbox" id="bands" />Stop bands</label>
+        <label class="check" title="One color band per stop (B)"><input type="checkbox" id="bands" /><span id="bands-text">Stop bands</span></label>
       </div>
 
       <div class="group">
@@ -92,7 +92,7 @@
           <button data-v="B" class="kB">B</button>
         </div>
         <div class="window-inputs">
-          <label>Window <input id="win-lo" type="number" step="0.25" /> … <input id="win-hi" type="number" step="0.25" /> EV</label>
+          <label id="win-label" title="Stops relative to 0.18 middle grey">Window <input id="win-lo" type="number" step="0.25" /> … <input id="win-hi" type="number" step="0.25" /><span id="win-unit"> stops</span></label>
           <button id="win-auto" title="Fit window to the 0.5–99.9% luminance percentiles (A)">Auto</button>
           <button id="win-full" title="Window covers all positive values">Full</button>
         </div>

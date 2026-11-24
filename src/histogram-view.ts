@@ -1,7 +1,7 @@
 import { colormapLut } from './colormaps';
-import { CLIP_COLORS, evToDisplayT, type DisplayParams } from './display';
+import { CLIP_COLORS, clampWindow, evToDisplayT, MIN_WINDOW, type DisplayParams } from './display';
 import { BINS_PER_STOP, cumAt, cumulative, EV_END, EV_ORIGIN, evToBin, percentileEv } from './histogram';
-import { fmtEv, fmtValue } from './format';
+import { fmtLevel, fmtRange, fmtStops, fmtValue, GRID_ORIGIN, SHOW_STOPS } from './format';
 import type { ChannelKey, ChannelStats, DecodedImage } from './types';
 
 export type YScale = 'linear' | 'sqrt' | 'log';
@@ -95,6 +95,7 @@ export class HistogramView {
         hi = Math.max(hi, Math.log2(h.stats.maxPos));
       }
     }
+    this.range = Number.isFinite(lo) ? [lo, hi] : null;
     if (!Number.isFinite(lo)) [lo, hi] = [-10, 10];
     // Pad and keep a minimum span so tiny ranges are still readable.
     lo = Math.floor(lo) - 1;
@@ -122,6 +123,12 @@ export class HistogramView {
   }
 
   private focus: [number, number] = [-10, 10];
+  /** log2 of the smallest and largest positive value in any channel; the window stays inside it. */
+  private range: [number, number] | null = null;
+
+  dataRange() {
+    return this.range;
+  }
 
   cumFor(k: ChannelKey) {
     return this.cum[k];
@@ -173,10 +180,10 @@ export class HistogramView {
     this.emitHover();
   }
 
-  private setWindow(lo: number, hi: number) {
+  private setWindow(lo: number, hi: number, keepSpan = false) {
     if (hi < lo) [lo, hi] = [hi, lo];
-    if (hi - lo < 1 / 64) hi = lo + 1 / 64;
-    this.cb.onWindow(lo, hi);
+    if (hi - lo < MIN_WINDOW) hi = lo + MIN_WINDOW;
+    this.cb.onWindow(...clampWindow(lo, hi, this.range, keepSpan));
   }
 
   // ---------- interaction: main ----------
@@ -227,9 +234,9 @@ export class HistogramView {
             this.setView(d.v0 - dEv, d.v1 - dEv);
             break;
           }
-          case 'lo': this.setWindow(Math.min(ev, this.display.hi - 1 / 64), this.display.hi); break;
-          case 'hi': this.setWindow(this.display.lo, Math.max(ev, this.display.lo + 1 / 64)); break;
-          case 'move': this.setWindow(d.lo + ev - d.startEv, d.hi + ev - d.startEv); break;
+          case 'lo': this.setWindow(Math.min(ev, this.display.hi - MIN_WINDOW), this.display.hi); break;
+          case 'hi': this.setWindow(this.display.lo, Math.max(ev, this.display.lo + MIN_WINDOW)); break;
+          case 'move': this.setWindow(d.lo + ev - d.startEv, d.hi + ev - d.startEv, true); break;
           case 'select': this.setWindow(d.anchor, ev); break;
         }
       }
@@ -395,18 +402,23 @@ export class HistogramView {
     g.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
     g.textAlign = 'center';
     g.textBaseline = 'top';
-    for (let ev = Math.ceil(this.v0 / step) * step; ev <= this.v1; ev += step) {
+    // Ticks fall on a power-of-two grid from GRID_ORIGIN; the brighter line marks the origin.
+    for (let s = Math.ceil((this.v0 - GRID_ORIGIN) / step) * step; s <= this.v1 - GRID_ORIGIN; s += step) {
+      const ev = s + GRID_ORIGIN;
       const x = Math.round(this.xAt(ev)) + 0.5;
-      const isInt = Math.abs(ev - Math.round(ev)) < 1e-9;
-      g.strokeStyle = isInt && Math.round(ev) === 0 ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.07)';
+      g.strokeStyle = Math.abs(s) < 1e-9 ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.07)';
       g.beginPath();
       g.moveTo(x, plotTop);
       g.lineTo(x, plotBottom);
       g.stroke();
       g.fillStyle = 'rgba(220,220,220,0.85)';
-      g.fillText(fmtEv(ev, step < 1 ? 3 : 0), x, plotBottom + 4);
-      g.fillStyle = 'rgba(160,160,160,0.75)';
-      g.fillText(fmtValue(2 ** ev), x, plotBottom + 17);
+      if (SHOW_STOPS) {
+        g.fillText(fmtStops(ev, step < 1 ? 3 : 0), x, plotBottom + 4);
+        g.fillStyle = 'rgba(160,160,160,0.75)';
+        g.fillText(fmtValue(2 ** ev), x, plotBottom + 17);
+      } else {
+        g.fillText(fmtValue(2 ** ev), x, plotBottom + 4);
+      }
     }
 
     // Histogram curves: compute densities per device pixel column.
@@ -516,7 +528,8 @@ export class HistogramView {
     g.textBaseline = 'top';
     g.fillStyle = 'rgba(200,200,200,0.7)';
     const peakPct = (max * BINS_PER_STOP / this.total) * 100;
-    g.fillText(`peak ${peakPct < 0.01 ? peakPct.toExponential(1) : peakPct.toPrecision(3)}% / stop · ${this.yScale}`, 6, plotTop + 4);
+    const peak = `peak ${peakPct < 0.01 ? peakPct.toExponential(1) : peakPct.toPrecision(3)}% / stop · `;
+    g.fillText(`${SHOW_STOPS ? peak : ''}${this.yScale}`, 6, plotTop + 4);
     const s = this.stats.L!;
     const specials: [string, number, readonly number[]][] = [
       ['zero', s.zero, CLIP_COLORS.under],
@@ -562,7 +575,7 @@ export class HistogramView {
 
     // Window label in the lane.
     const loX = this.xAt(p.lo), hiX = this.xAt(p.hi);
-    const label = `${fmtEv(p.lo, 2)} … ${fmtEv(p.hi, 2)} EV  (${(p.hi - p.lo).toFixed(2)} stops)`;
+    const label = fmtRange(p.lo, p.hi);
     g.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
     const tw = g.measureText(label).width + 10;
     const cx = Math.min(w - tw / 2 - 2, Math.max(tw / 2 + 2, (Math.max(0, loX) + Math.min(w, hiX)) / 2));
@@ -618,14 +631,15 @@ export class HistogramView {
     }
     const ev = this.evAt(x);
     const half = ((this.v1 - this.v0) / this.width) * 3;
-    const lines = [`<b>${fmtEv(ev, 2)} EV</b> · ${fmtValue(2 ** ev)}`];
+    const lines = [SHOW_STOPS ? `<b>${fmtLevel(ev)}</b> · ${fmtValue(2 ** ev)}` : `<b>${fmtValue(2 ** ev)}</b>`];
     for (const k of ['L', 'R', 'G', 'B'] as ChannelKey[]) {
       if (!this.channels.has(k)) continue;
       const cum = this.cum[k]!;
       const total = this.totals[k]!;
       const perStop = (this.density(cum, ev - half, ev + half) * BINS_PER_STOP / total) * 100;
       const below = (cumAt(cum, evToBin(ev)) + this.stats[k]!.zero + this.stats[k]!.neg) / total * 100;
-      lines.push(`<span class="k k${k}">${k}</span> ${perStop.toPrecision(3)}%/stop · ${below.toFixed(2)}% below`);
+      const density = SHOW_STOPS ? `${perStop.toPrecision(3)}%/stop · ` : '';
+      lines.push(`<span class="k k${k}">${k}</span> ${density}${below.toFixed(2)}% below`);
     }
     const near = this.markers.filter((m) => Math.abs(this.xAt(m.ev) - x) <= 4);
     for (const m of near) lines.push(`<span style="color:${m.color}">${m.title ?? m.label}</span>`);
