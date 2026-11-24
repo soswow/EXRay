@@ -761,10 +761,10 @@ function syncControls() {
   histChannels.querySelectorAll('button').forEach((b) =>
     b.setAttribute('aria-pressed', String(hist.channels.has(b.dataset.v as ChannelKey))),
   );
-  colormapSel.disabled = params.mode !== 'false';
-  transferSel.disabled = params.mode !== 'linear';
+  colormapSel.hidden = params.mode !== 'false';
+  transferSel.hidden = params.mode !== 'linear';
   transferSel.value = params.transfer;
-  $<HTMLInputElement>('bands').disabled = params.mode !== 'false';
+  $('bands').parentElement!.hidden = params.mode !== 'false';
   $<HTMLInputElement>('bands').checked = params.bands;
   $<HTMLInputElement>('clip').checked = params.clip;
   $<HTMLInputElement>('isolate').checked = params.isolate;
