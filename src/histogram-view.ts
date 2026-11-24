@@ -1,7 +1,7 @@
 import { colormapLut } from './colormaps';
 import { CLIP_COLORS, clampWindow, evToDisplayT, MIN_WINDOW, type DisplayParams } from './display';
 import { BINS_PER_STOP, cumAt, cumulative, EV_END, EV_ORIGIN, evToBin, percentileEv } from './histogram';
-import { fmtLevel, fmtRange, fmtStops, fmtValue, GRID_ORIGIN, SHOW_STOPS } from './format';
+import { fmtLevel, fmtLinear, fmtRange, fmtStops, fmtValue, gridOrigin, rawReadout, SHOW_STOPS } from './format';
 import type { ChannelKey, ChannelStats, DecodedImage } from './types';
 
 export type YScale = 'linear' | 'sqrt' | 'log';
@@ -402,9 +402,10 @@ export class HistogramView {
     g.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
     g.textAlign = 'center';
     g.textBaseline = 'top';
-    // Ticks fall on a power-of-two grid from GRID_ORIGIN; the brighter line marks the origin.
-    for (let s = Math.ceil((this.v0 - GRID_ORIGIN) / step) * step; s <= this.v1 - GRID_ORIGIN; s += step) {
-      const ev = s + GRID_ORIGIN;
+    // Ticks fall on a power-of-two grid from the grid origin; the brighter line marks the origin.
+    const origin = gridOrigin();
+    for (let s = Math.ceil((this.v0 - origin) / step) * step; s <= this.v1 - origin; s += step) {
+      const ev = s + origin;
       const x = Math.round(this.xAt(ev)) + 0.5;
       g.strokeStyle = Math.abs(s) < 1e-9 ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.07)';
       g.beginPath();
@@ -414,6 +415,11 @@ export class HistogramView {
       g.fillStyle = 'rgba(220,220,220,0.85)';
       if (SHOW_STOPS) {
         g.fillText(fmtStops(ev, step < 1 ? 3 : 0), x, plotBottom + 4);
+        g.fillStyle = 'rgba(160,160,160,0.75)';
+        g.fillText(fmtLinear(2 ** ev), x, plotBottom + 17);
+      } else if (rawReadout()) {
+        // RAW: the raw integer, and below it the ratio to the white level.
+        g.fillText(fmtLinear(2 ** ev), x, plotBottom + 4);
         g.fillStyle = 'rgba(160,160,160,0.75)';
         g.fillText(fmtValue(2 ** ev), x, plotBottom + 17);
       } else {
@@ -532,8 +538,8 @@ export class HistogramView {
     g.fillText(`${SHOW_STOPS ? peak : ''}${this.yScale}`, 6, plotTop + 4);
     const s = this.stats.L!;
     const specials: [string, number, readonly number[]][] = [
-      ['zero', s.zero, CLIP_COLORS.under],
-      ['neg', s.neg, CLIP_COLORS.negative],
+      [rawReadout() ? 'at black' : 'zero', s.zero, CLIP_COLORS.under],
+      [rawReadout() ? 'below black' : 'neg', s.neg, CLIP_COLORS.negative],
       ['NaN', s.nan, CLIP_COLORS.nan],
       ['Inf', s.inf, CLIP_COLORS.nan],
     ];
@@ -631,7 +637,11 @@ export class HistogramView {
     }
     const ev = this.evAt(x);
     const half = ((this.v1 - this.v0) / this.width) * 3;
-    const lines = [SHOW_STOPS ? `<b>${fmtLevel(ev)}</b> · ${fmtValue(2 ** ev)}` : `<b>${fmtValue(2 ** ev)}</b>`];
+    const lines = [
+      SHOW_STOPS ? `<b>${fmtLevel(ev)}</b> · ${fmtLinear(2 ** ev)}`
+        : rawReadout() ? `<b>${fmtLinear(2 ** ev)} DN</b> · ${fmtValue(2 ** ev)}`
+        : `<b>${fmtValue(2 ** ev)}</b>`,
+    ];
     for (const k of ['L', 'R', 'G', 'B'] as ChannelKey[]) {
       if (!this.channels.has(k)) continue;
       const cum = this.cum[k]!;

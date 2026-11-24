@@ -1,5 +1,5 @@
 import { CLIP_COLORS, type DisplayParams } from './display';
-import { GRID_ORIGIN } from './format';
+import { gridOrigin } from './format';
 
 const VERT = /* glsl */ `#version 300 es
 void main() {
@@ -34,7 +34,7 @@ uniform ivec2 u_period;
 
 uniform vec3 c_under, c_over, c_nan, c_neg, c_hover;
 
-const float GRID_ORIGIN = ${GRID_ORIGIN.toFixed(9)}; // log2 where bands start (see format.ts)
+uniform float u_gridOrigin; // log2 where bands start (see format.ts)
 
 out vec4 outColor;
 
@@ -53,7 +53,7 @@ float windowT(float v) {
   }
   if (v <= 0.0) return -1.0;
   float ev = log2(v);
-  if (u_mode == 2 && u_bands) ev = floor(ev - GRID_ORIGIN) + 0.5 + GRID_ORIGIN;
+  if (u_mode == 2 && u_bands) ev = floor(ev - u_gridOrigin) + 0.5 + u_gridOrigin;
   return (ev - u_lo) / (u_hi - u_lo);
 }
 
@@ -262,6 +262,7 @@ export class Renderer {
     gl.uniform1i(this.u('u_clip'), p.clip ? 1 : 0);
     gl.uniform1i(this.u('u_isolate'), p.isolate ? 1 : 0);
     gl.uniform1i(this.u('u_bands'), p.bands ? 1 : 0);
+    gl.uniform1f(this.u('u_gridOrigin'), gridOrigin());
     gl.uniform2f(this.u('u_hover'), hover ? hover[0] : 1, hover ? hover[1] : 0);
     gl.uniform3f(this.u('u_weights'), weights[0], weights[1], weights[2]);
     gl.uniform3fv(this.u('c_under'), CLIP_COLORS.under);

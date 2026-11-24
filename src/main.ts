@@ -2,7 +2,7 @@ import './style.css';
 import { colormapLut, type ColormapId } from './colormaps';
 import { clampWindow, type DisplayMode, type DisplayParams, type ViewChannel } from './display';
 import { pixelTypeName } from './exr-header';
-import { fmtBytes, fmtLevel, fmtRange, fmtValue, escapeHtml, fromStops, gridCeil, gridFloor, inputToLevel, levelToInput, SHOW_STOPS } from './format';
+import { fmtBytes, fmtDn, fmtLevel, fmtLinear, fmtRange, fmtValue, escapeHtml, fromStops, gridCeil, gridFloor, inputToLevel, levelToInput, setRawReadout, SHOW_STOPS } from './format';
 import { percentileEv } from './histogram';
 import { HistogramView, type HistMarker, type YScale } from './histogram-view';
 import { Renderer } from './renderer';
@@ -202,6 +202,8 @@ function setImage(img: DecodedImage, keepView: boolean) {
   layerSel.value = img.layer;
   if (img.luminanceOnly && params.channel !== 'rgb' && params.channel !== 'l') params.channel = 'rgb';
 
+  // RAW files read out as raw integers, on the green channel's black level and range.
+  setRawReadout(img.raw ? { black: greenBlack(img.raw), range: img.raw.white - greenBlack(img.raw) } : null);
   hist.markers = img.raw ? rawMarkers(img.raw) : [];
   hist.setImage(img);
   if (!keepView || first) {
@@ -332,39 +334,43 @@ function updateProbe(e: PointerEvent) {
 }
 
 function rawProbe(probe: HTMLElement, raw: RawImage, x: number, y: number, R: number, G: number, B: number, L: number) {
-  const row = (k: string, v: number) => `<span class="k${k}">${k.padEnd(2)}</span> ${fmtValue(v).padStart(10)}`;
-  const lines = [`x ${x}  y ${y}`];
   const names = ['R', 'G', 'B', 'G2'];
   const w = image!.width;
-  // Raw integers at this pixel: one photosite for a mosaic, three values for linear files.
-  const sites: { k: number; cell: number; dn: number }[] = [];
-  if (raw.kind === 'cfa') {
-    const cell = (y % raw.cellH) * raw.cellW + (x % raw.cellW);
-    sites.push({ k: raw.cellColor[cell], cell, dn: raw.dn[y * w + x] });
-  } else {
-    for (let c = 0; c < 3; c++) sites.push({ k: c, cell: c, dn: raw.dn[(y * w + x) * 3 + c] });
-  }
-  for (const s of sites) {
-    const black = raw.cellBlack[s.cell];
-    const rel = (s.dn - black) / (raw.white - black);
-    const cls = names[s.k === 3 ? 1 : s.k];
-    lines.push(
-      `<span class="k${cls}">${names[s.k].padEnd(2)}</span> <b>${String(s.dn).padStart(5)}</b> DN  ` +
-        `<span class="ev">−${fmtValue(black)} → ${String(s.dn - black).padStart(5)}  ·  ${(rel * 100).toFixed(2).padStart(6)}% of ${raw.white - black}</span>`,
-    );
-  }
-  const mosaic = mosaicShown();
-  lines.push(mosaic ? '<span class="ev">photosite value</span>' : '<span class="ev">demosaiced</span>');
+  // Photosite under the cursor (mosaic files): its color and cell.
+  const cell = raw.kind === 'cfa' ? (y % raw.cellH) * raw.cellW + (x % raw.cellW) : -1;
+  const site = cell >= 0 ? raw.cellColor[cell] : -1;
+  const siteChannel = site === 3 ? 1 : site;
+
+  // Value → raw integer for channel c: DN = black + value / scale (scale includes white balance).
+  const cellOf = (c: number) => {
+    const i = raw.cellColor.findIndex((k) => k === c || (c === 1 && k === 3));
+    return Math.max(0, i);
+  };
+  const toDn = (c: number, v: number) => raw.cellBlack[cellOf(c)] + v / raw.cellScale[cellOf(c)];
+  const approx = raw.mode === '709';
+  const row = (label: string, cls: string, dn: string, v: number, mark = '') =>
+    `<span class="k${cls}">${label.padEnd(2)}</span> ${dn.padStart(8)} ${fmtValue(v).padStart(9)}${mark}`;
+
+  const mosaic = mosaicShown() && cell >= 0;
+  const lines = [`x ${x}  y ${y}${site >= 0 && !mosaic ? `  ·  ${names[site]} photosite` : ''}`];
   if (mosaic) {
-    const s = sites[0], cls = names[s.k === 3 ? 1 : s.k];
-    const v = (s.dn - raw.cellBlack[s.cell]) * raw.cellScale[s.cell];
-    lines.push(row(cls, v));
+    const dn = raw.dn[y * w + x];
+    const v = (dn - raw.cellBlack[cell]) * raw.cellScale[cell];
+    lines.push('<span class="ev">photosite        DN     ratio</span>');
+    lines.push(row(names[site], names[siteChannel], String(dn), v));
     probe.innerHTML = lines.join('\n');
     probe.hidden = false;
-    hist.setProbe({ [cls]: v });
+    hist.setProbe({ [names[siteChannel]]: v });
     return;
   }
-  lines.push(row('R', R), row('G', G), row('B', B), row('L', L));
+  lines.push(`<span class="ev">demosaiced      ${approx ? 'DN≈' : ' DN'}     ratio</span>`);
+  [R, G, B].forEach((v, c) => {
+    // The photosite's own channel is the exact raw integer; the others are interpolated.
+    const exact = c === siteChannel && !approx;
+    const dn = exact ? String(raw.dn[y * w + x]) : raw.kind === 'linear' && !approx ? String(raw.dn[(y * w + x) * 3 + c]) : fmtDn(toDn(c, v));
+    lines.push(row(names[c], names[c], dn, v, exact ? ' <span class="ev">•</span>' : ''));
+  });
+  lines.push(row('L', 'L', fmtLinear(L), L));
   probe.innerHTML = lines.join('\n');
   probe.hidden = false;
   hist.setProbe({ R, G, B, L });
@@ -450,7 +456,7 @@ function renderInfo() {
       ['Sensor', `${raw.pattern}${raw.kind === 'cfa' ? ` (${raw.cellW}×${raw.cellH} cell)` : ''}`],
       ['Black level', blacks],
       ['White level', `${raw.white} (${raw.bits}-bit)${raw.linearMax && raw.linearMax !== raw.white ? ` · linear max ${raw.linearMax}` : ''}`],
-      ['Normalized', '1.0 = white level, after black subtraction'],
+      ['Readouts', 'raw integers (DN); ratio = (DN − black) ÷ (white − black)'],
       ...raw.attributes.map((a): [string, string] => [a.name, a.display]),
     ];
     const n = rawNoise(raw);
@@ -504,11 +510,11 @@ function renderInfo() {
   rows.push(
     '<h2>Channels</h2>',
     `<table><tr><th></th>${keys.map((k) => `<th>${k}</th>`).join('')}</tr>` +
-      `<tr><td>max</td>${stat((s) => fmtValue(s.maxPos))}</tr>` +
-      `<tr><td>min &gt; 0</td>${stat((s) => fmtValue(s.minPos))}</tr>` +
-      `<tr><td>min</td>${stat((s) => (s.neg ? fmtValue(s.minNeg) : s.zero ? '0' : fmtValue(s.minPos)))}</tr>` +
-      `<tr><td>zero</td>${stat((s) => pct(s.zero))}</tr>` +
-      `<tr><td>negative</td>${stat((s) => pct(s.neg))}</tr>` +
+      `<tr><td>max</td>${stat((s) => fmtLinear(s.maxPos))}</tr>` +
+      `<tr><td>min &gt; 0</td>${stat((s) => fmtLinear(s.minPos))}</tr>` +
+      `<tr><td>min</td>${stat((s) => (s.neg ? fmtLinear(s.minNeg) : s.zero ? fmtLinear(0) : fmtLinear(s.minPos)))}</tr>` +
+      `<tr><td>${raw ? 'at black' : 'zero'}</td>${stat((s) => pct(s.zero))}</tr>` +
+      `<tr><td>${raw ? 'below black' : 'negative'}</td>${stat((s) => pct(s.neg))}</tr>` +
       `<tr><td>NaN</td>${stat((s) => pct(s.nan))}</tr>` +
       `<tr><td>Inf</td>${stat((s) => pct(s.inf))}</tr></table>`,
   );

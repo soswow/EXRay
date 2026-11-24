@@ -17,7 +17,7 @@ export interface DisplayParams {
   lo: number;
   hi: number;
   colormap: ColormapId;
-  /** Quantize false color into one band per power of two, aligned to GRID_ORIGIN. */
+  /** Quantize false color into one band per power of two, aligned to the grid origin (format.ts). */
   bands: boolean;
   /** Mark out-of-window and special values with solid colors. */
   clip: boolean;

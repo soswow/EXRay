@@ -21,7 +21,7 @@ Explore the full dynamic range of HDR OpenEXR images — entirely in the browser
 - **Camera RAW files** (CR2/CR3, NEF, ARW, DNG, RAF, ORF, RW2, PEF, X3F, …), unpacked by [LibRaw](https://www.libraw.org/) compiled to WebAssembly and loaded only when a RAW file is opened.
   - Values are normalized so 1.0 is the white level after black subtraction, so the histogram shows the headroom below sensor saturation.
   - Zoom in (or press `M`) to see the **mosaic**: every photosite in its own color with its true value, no interpolation. Zoomed out, a bilinear demosaic is shown.
-  - The pixel probe shows the raw integer (DN), the black level, and the value relative to the white level.
+  - Readouts are raw integers (DN): histogram axis and tooltip, window inputs, statistics and the pixel probe. The axis and probe also show the ratio, (DN − black) ÷ (white − black). Axis ticks fall on black + 1, 2, 4, … DN.
   - Three ways to turn sensor values into RGB: camera RGB, white-balanced camera RGB, or linear Rec.709 through the camera matrix. R/G/B histograms count real photosites only.
   - The histogram marks the white level, the camera's linear maximum, 1 DN above black (where values become coarse integers) and the read-noise floor.
   - Read noise is measured from the sensor's masked (optical black) border when the file includes one, giving the engineering dynamic range: white ÷ read noise, in stops.
