@@ -348,22 +348,27 @@ function rawProbe(probe: HTMLElement, raw: RawImage, x: number, y: number, R: nu
   };
   const toDn = (c: number, v: number) => raw.cellBlack[cellOf(c)] + v / raw.cellScale[cellOf(c)];
   const approx = raw.mode === '709';
-  const row = (label: string, cls: string, dn: string, v: number, mark = '') =>
-    `<span class="k${cls}">${label.padEnd(2)}</span> ${dn.padStart(8)} ${fmtValue(v).padStart(9)}${mark}`;
+  // Fixed-width columns: label, DN, ratio. The header uses the same widths.
+  const cols = (label: string, dn: string, ratio: string) => [label.padEnd(2), dn.padStart(8), ratio.padStart(9)];
+  const row = (label: string, cls: string, dn: string, v: number, mark = '') => {
+    const [l, d, r] = cols(label, dn, fmtValue(v));
+    return `<span class="k${cls}">${l}</span> ${d} ${r}${mark}`;
+  };
+  const header = (dnLabel: string) => `<span class="ev">${cols('', dnLabel, 'ratio').join(' ')}</span>`;
 
   const mosaic = mosaicShown() && cell >= 0;
-  const lines = [`x ${x}  y ${y}${site >= 0 && !mosaic ? `  ·  ${names[site]} photosite` : ''}`];
+  const lines = [`x ${x}  y ${y}`];
   if (mosaic) {
     const dn = raw.dn[y * w + x];
     const v = (dn - raw.cellBlack[cell]) * raw.cellScale[cell];
-    lines.push('<span class="ev">photosite        DN     ratio</span>');
+    lines.push(`<span class="ev">${names[site]} photosite</span>`, header('DN'));
     lines.push(row(names[site], names[siteChannel], String(dn), v));
     probe.innerHTML = lines.join('\n');
     probe.hidden = false;
     hist.setProbe({ [names[siteChannel]]: v });
     return;
   }
-  lines.push(`<span class="ev">demosaiced      ${approx ? 'DN≈' : ' DN'}     ratio</span>`);
+  lines.push(`<span class="ev">demosaiced${site >= 0 ? ` · ${names[site]} photosite •` : ''}</span>`, header(approx ? 'DN≈' : 'DN'));
   [R, G, B].forEach((v, c) => {
     // The photosite's own channel is the exact raw integer; the others are interpolated.
     const exact = c === siteChannel && !approx;
