@@ -205,7 +205,7 @@ function setImage(img: DecodedImage, keepView: boolean) {
   // RAW files read out as raw integers, on the green channel's black level and range.
   setRawReadout(img.raw ? { black: greenBlack(img.raw), range: img.raw.white - greenBlack(img.raw) } : null);
   hist.markers = img.raw ? rawMarkers(img.raw) : [];
-  $('win-auto').title = `Fit window to the ${img.raw ? '0.01–99.99' : '0.5–99.9'}% luminance percentiles (A)`;
+  $('win-auto').title = `Fit window to the ${img.raw ? '0.001–99.999' : '0.5–99.9'}% luminance percentiles (A)`;
   hist.setImage(img);
   if (!keepView || first) {
     autoWindow();
@@ -227,8 +227,8 @@ function setWindow(lo: number, hi: number, keepSpan = false) {
 function autoWindow() {
   const cum = hist.cumFor('L');
   if (!image || !cum || !image.histograms.L.stats.pos) return;
-  // RAW: the 0.01–99.99% luminance percentiles; otherwise 0.5–99.9%.
-  const [pLo, pHi] = image.raw ? [0.0001, 0.9999] : [0.005, 0.999];
+  // RAW: the 0.001–99.999% luminance percentiles; otherwise 0.5–99.9%.
+  const [pLo, pHi] = image.raw ? [0.00001, 0.99999] : [0.005, 0.999];
   let lo = percentileEv(cum, pLo);
   let hi = percentileEv(cum, pHi);
   if (hi - lo < 1) {
