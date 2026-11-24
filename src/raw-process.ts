@@ -1,12 +1,10 @@
 /**
  * Pure RAW processing helpers (no LibRaw): CFA cells, orientation, masked-pixel noise,
- * demosaicing and photosite histograms.
+ * demosaicing.
  *
  * Mosaic data is described by a repeating cell of cw × ch photosites anchored at the top-left
  * visible pixel; `site` gives each cell's color as 0 R, 1 G, 2 B.
  */
-import { HistogramAccumulator } from './histogram';
-
 function gcd(a: number, b: number): number {
   return b ? gcd(b, a % b) : a;
 }
@@ -89,41 +87,64 @@ export function orientCell<T>(cell: T[], cw: number, ch: number, W: number, H: n
 export interface MaskedNoise {
   /** Robust standard deviation (MAD × 1.4826) of masked photosites, in DN, pooled over CFA cells. */
   sigma: number;
-  /** Mean of masked photosites minus the black level the file declares, in DN. */
-  offset: number;
   pixels: number;
   region: string;
+  /** Mean DN and photosite count per CFA cell (same cell indexing as `cellIndex`). */
+  cellMean: number[];
+  cellCount: number[];
+}
+
+/** A rectangle of masked photosites, in raw coordinates; x1/y1 exclusive. */
+export interface MaskedRegion {
+  x0: number;
+  x1: number;
+  y0: number;
+  y1: number;
+  name: string;
 }
 
 /**
- * Estimates read noise from the sensor's masked border (left and top margins), which receives no
- * light. Rows/columns within `guard` of an edge are skipped, since they often hold transition
- * or dummy values.
+ * Masked border regions: the camera's own optical-black areas when known, else LibRaw's left
+ * and top margins. Rows/columns within `guard` of an edge are skipped, since they often hold
+ * transition or dummy values.
  */
-export function maskedNoise(
-  raw: Uint16Array,
+export function maskedRegions(
   rawW: number,
   rawH: number,
   left: number,
   top: number,
-  cellIndex: (x: number, y: number) => number,
-  cellBlack: number[],
+  known: { x: number; y: number; w: number; h: number; name: string }[],
   guard = 4,
-): MaskedNoise | null {
-  const regions: { x0: number; x1: number; y0: number; y1: number; name: string }[] = [];
-  if (left - 2 * guard >= 8) regions.push({ x0: guard, x1: left - guard, y0: top + guard, y1: rawH - guard, name: `left ${left} px` });
-  if (top - 2 * guard >= 8) regions.push({ x0: left + guard, x1: rawW - guard, y0: guard, y1: top - guard, name: `top ${top} px` });
-  if (!regions.length) return null;
+): MaskedRegion[] {
+  const out: MaskedRegion[] = [];
+  const add = (x0: number, x1: number, y0: number, y1: number, name: string) => {
+    if (x1 - x0 - 2 * guard >= 8 && y1 - y0 - 2 * guard >= 8) out.push({ x0: x0 + guard, x1: x1 - guard, y0: y0 + guard, y1: y1 - guard, name });
+  };
+  if (known.length) for (const k of known) add(k.x, k.x + k.w, k.y, k.y + k.h, k.name);
+  else {
+    add(0, left, top, rawH, `left ${left} px (LibRaw margin)`);
+    add(left, rawW, 0, top, `top ${top} px (LibRaw margin)`);
+  }
+  return out;
+}
 
+/** Estimates read noise and per-cell black from masked photosites, which receive no light. */
+export function maskedNoise(
+  raw: Uint16Array,
+  rawW: number,
+  regions: MaskedRegion[],
+  cellIndex: (x: number, y: number) => number,
+  cells: number,
+): MaskedNoise | null {
+  if (!regions.length) return null;
   // Per-cell histograms of DN, so median and MAD are exact.
-  const cells = cellBlack.length;
   const hists = Array.from({ length: cells }, () => new Uint32Array(65536));
   const counts = new Array(cells).fill(0);
   let pixels = 0;
   for (const r of regions) {
     for (let y = r.y0; y < r.y1; y++) {
       for (let x = r.x0; x < r.x1; x++) {
-        const c = cellIndex(x - left, y - top);
+        const c = cellIndex(x, y);
         hists[c][raw[y * rawW + x]]++;
         counts[c]++;
         pixels++;
@@ -141,9 +162,13 @@ export function maskedNoise(
     }
     return h.length - 1;
   };
-  let varSum = 0, offSum = 0, used = 0;
+  let varSum = 0, used = 0;
+  const cellMean: number[] = [];
   for (let c = 0; c < cells; c++) {
     const n = counts[c], h = hists[c];
+    let s = 0, s2 = 0;
+    for (let v = 0; v < 65536; v++) if (h[v]) { s += v * h[v]; s2 += v * v * h[v]; }
+    cellMean.push(n ? s / n : NaN);
     if (n < 100) continue;
     const med = quantile(h, n, 0.5);
     // MAD from a histogram of |v - med|.
@@ -152,17 +177,21 @@ export function maskedNoise(
     const mad = quantile(dev, n, 0.5);
     // With integer data and very low noise the MAD can be 0; fall back to the standard deviation.
     let sigma = mad * 1.4826;
-    if (sigma < 0.5) {
-      let s = 0, s2 = 0;
-      for (let v = 0; v < 65536; v++) if (h[v]) { s += v * h[v]; s2 += v * v * h[v]; }
-      sigma = Math.sqrt(Math.max(0, s2 / n - (s / n) ** 2));
-    }
+    if (sigma < 0.5) sigma = Math.sqrt(Math.max(0, s2 / n - (s / n) ** 2));
     varSum += sigma * sigma * n;
-    offSum += (med - cellBlack[c]) * n;
     used += n;
   }
   if (!used) return null;
-  return { sigma: Math.sqrt(varSum / used), offset: offSum / used, pixels, region: regions.map((r) => r.name).join(' + ') };
+  return { sigma: Math.sqrt(varSum / used), pixels, region: regions.map((r) => r.name).join(' + '), cellMean, cellCount: counts };
+}
+
+/** The same repeating cell, re-anchored so that its (0, 0) is the old cell's (ox, oy). */
+export function shiftCell<T>(cell: T[], cw: number, ch: number, ox: number, oy: number): T[] {
+  const out: T[] = [];
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) out.push(cell[(((y + oy) % ch) + ch) % ch * cw + ((((x + ox) % cw) + cw) % cw)]);
+  }
+  return out;
 }
 
 // ---------- demosaic ----------
@@ -258,27 +287,4 @@ export function demosaic(
       }
     }
   }
-}
-
-/** R/G/B histograms over the photosites of each color, without interpolated values. */
-export function photositeHist(norm: Float32Array, inStride: number, inOffset: number, W: number, H: number, site: number[], cw: number, ch: number) {
-  const acc = [new HistogramAccumulator(), new HistogramAccumulator(), new HistogramAccumulator()];
-  const CHUNK = 1 << 16;
-  const bufs = [0, 1, 2].map(() => new Float32Array(CHUNK));
-  const bits = bufs.map((b) => new Uint32Array(b.buffer));
-  const fill = [0, 0, 0];
-  const flush = (k: number) => {
-    acc[k].add(bufs[k], bits[k], 0, 1, fill[k]);
-    fill[k] = 0;
-  };
-  for (let y = 0; y < H; y++) {
-    const row = y * W, cy = (y % ch) * cw;
-    for (let x = 0; x < W; x++) {
-      const k = site[cy + (x % cw)];
-      bufs[k][fill[k]++] = norm[(row + x) * inStride + inOffset];
-      if (fill[k] === CHUNK) flush(k);
-    }
-  }
-  for (let k = 0; k < 3; k++) flush(k);
-  return { R: acc[0].result(), G: acc[1].result(), B: acc[2].result() };
 }

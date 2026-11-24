@@ -1,10 +1,15 @@
 import { colormapLut } from './colormaps';
 import { CLIP_COLORS, clampWindow, evToDisplayT, MIN_WINDOW, type DisplayParams } from './display';
-import { BINS_PER_STOP, cumAt, cumulative, EV_END, EV_ORIGIN, evToBin, percentileEv } from './histogram';
+import { BINS_PER_STOP, cumAt, cumulative, EV_END, EV_ORIGIN, evToBin, exactBelow, percentileEv } from './histogram';
 import { fmtLevel, fmtLinear, fmtRange, fmtStops, fmtValue, gridOrigin, rawReadout, SHOW_STOPS } from './format';
-import type { ChannelKey, ChannelStats, DecodedImage } from './types';
+import type { ChannelHistogram, ChannelKey, ChannelStats, DecodedImage } from './types';
 
 export type YScale = 'linear' | 'sqrt' | 'log';
+/**
+ * X axis: log2 of the value (equal width per stop), the value itself (equal width per DN for
+ * RAW), or its signed square root (shot noise looks about equally wide everywhere).
+ */
+export type XScale = 'log' | 'linear' | 'sqrt';
 
 interface Callbacks {
   /** The user changed the display window. */
@@ -45,11 +50,17 @@ type Drag =
   | { kind: 'ov-lo' | 'ov-hi' };
 
 /**
- * The interactive histogram: a log2 (EV) x-axis that pans and zooms like a timeline,
- * an overview strip of the whole data range, and a draggable display window.
+ * The interactive histogram: an x-axis that pans and zooms like a timeline, an overview strip of
+ * the whole data range, and a draggable display window.
+ *
+ * The view (v0, v1), extent and focus are in axis units u = toU(value), which depend on xScale.
+ * The display window, markers and pixel hover stay in log2 of the value ("ev"), as the renderer
+ * uses them; uOfEv / evOfU convert.
  */
 export class HistogramView {
   private cum: Partial<Record<ChannelKey, Float64Array>> = {};
+  /** Exact distributions (RAW photosites), used instead of the log2 bins when present. */
+  private exact: Partial<Record<ChannelKey, ChannelHistogram['exact']>> = {};
   private stats: Partial<Record<ChannelKey, ChannelStats>> = {};
   private total = 0;
   /** Values per channel; RAW photosite channels have fewer values than pixels. */
@@ -61,6 +72,7 @@ export class HistogramView {
   v0 = -10;
   v1 = 10;
   yScale: YScale = 'sqrt';
+  xScale: XScale = 'log';
   channels = new Set<ChannelKey>(['L']);
   display!: DisplayParams;
 
@@ -82,11 +94,13 @@ export class HistogramView {
   }
 
   setImage(img: DecodedImage) {
+    this.tooltip.hidden = true; // its readout belonged to the previous image
     this.total = img.width * img.height;
     let lo = Infinity, hi = -Infinity;
     for (const k of ['L', 'R', 'G', 'B'] as ChannelKey[]) {
       const h = img.histograms[k];
       this.cum[k] = cumulative(h.bins);
+      this.exact[k] = h.exact;
       this.stats[k] = h.stats;
       const t = h.stats.pos + h.stats.zero + h.stats.neg + h.stats.nan + h.stats.inf;
       this.totals[k] = t || this.total;
@@ -96,30 +110,103 @@ export class HistogramView {
       }
     }
     this.range = Number.isFinite(lo) ? [lo, hi] : null;
-    if (!Number.isFinite(lo)) [lo, hi] = [-10, 10];
-    // Pad and keep a minimum span so tiny ranges are still readable.
-    lo = Math.floor(lo) - 1;
-    hi = Math.ceil(hi) + 1;
-    if (hi - lo < 8) {
-      const c = (lo + hi) / 2;
-      lo = c - 4;
-      hi = c + 4;
-    }
-    this.extent = [Math.max(EV_ORIGIN, lo), Math.min(EV_END, hi)];
-
-    // The default view focuses on where the data is (ignoring a few far outliers such as
-    // denormals); the overview strip always shows the full extent.
-    const cumL = this.cum.L!;
-    if (img.histograms.L.stats.pos) {
-      let f0 = Math.floor(percentileEv(cumL, 0.005)) - 3;
-      let f1 = Math.ceil(percentileEv(cumL, 0.9995)) + 2;
-      f0 = Math.min(f0, Math.log2(img.histograms.L.stats.maxPos) - 8);
-      f1 = Math.max(f1, Math.log2(img.histograms.L.stats.maxPos) + 1);
-      this.focus = [Math.max(this.extent[0], f0), Math.min(this.extent[1], f1)];
-    } else {
-      this.focus = this.extent;
-    }
+    this.computeExtent();
     this.fitView();
+  }
+
+  /** Switches the x axis and shows the data's focus range in the new units. */
+  setXScale(x: XScale) {
+    if (x === this.xScale) return;
+    this.xScale = x;
+    if (!this.cum.L) return;
+    this.computeExtent();
+    this.tooltip.hidden = true;
+  }
+
+  /** Overview extent and default view, in axis units. */
+  private computeExtent() {
+    const statsL = this.stats.L!;
+    const cumL = this.cum.L!;
+    if (this.xScale === 'log') {
+      let [lo, hi] = this.range ?? [-10, 10];
+      // Pad and keep a minimum span so tiny ranges are still readable.
+      lo = Math.floor(lo) - 1;
+      hi = Math.ceil(hi) + 1;
+      if (hi - lo < 8) {
+        const c = (lo + hi) / 2;
+        lo = c - 4;
+        hi = c + 4;
+      }
+      this.extent = [Math.max(EV_ORIGIN, lo), Math.min(EV_END, hi)];
+      // The default view focuses on where the data is (ignoring a few far outliers such as
+      // denormals); the overview strip always shows the full extent.
+      if (statsL.pos) {
+        let f0 = Math.floor(percentileEv(cumL, 0.005)) - 3;
+        let f1 = Math.ceil(percentileEv(cumL, 0.9995)) + 2;
+        f0 = Math.min(f0, Math.log2(statsL.maxPos) - 8);
+        f1 = Math.max(f1, Math.log2(statsL.maxPos) + 1);
+        this.focus = [Math.max(this.extent[0], f0), Math.min(this.extent[1], f1)];
+      } else {
+        this.focus = this.extent;
+      }
+    } else {
+      // From the lowest exact value (RAW: below black) or 0, to the largest value in any channel.
+      let lo = 0, hi = 0;
+      for (const k of ['L', 'R', 'G', 'B'] as ChannelKey[]) {
+        const ex = this.exact[k];
+        if (ex?.values.length) lo = Math.min(lo, ex.values[0]);
+        hi = Math.max(hi, this.stats[k]!.maxPos);
+      }
+      // Reference markers (e.g. the RAW white level) stay reachable even above the data.
+      for (const m of this.markers) hi = Math.max(hi, 2 ** m.ev);
+      if (!(hi > lo)) hi = lo + 1;
+      const e0 = this.toU(lo), e1 = this.toU(hi), pad = (e1 - e0) * 0.02;
+      this.extent = [e0 - pad, e1 + pad];
+      // Focus: the bulk of the luminance, and every reference marker (e.g. RAW white levels).
+      let f1 = statsL.pos ? 2 ** percentileEv(cumL, 0.9995) * 1.25 : hi;
+      for (const m of this.markers) f1 = Math.max(f1, 2 ** m.ev * 1.03);
+      this.focus = [this.extent[0], Math.min(this.extent[1], this.toU(f1))];
+    }
+    [this.v0, this.v1] = this.focus;
+    this.redraw();
+  }
+
+  // ---------- axis units ----------
+
+  /** Value → axis units. */
+  private toU(v: number) {
+    switch (this.xScale) {
+      case 'log': return v > 0 ? Math.log2(v) : -Infinity;
+      case 'linear': return v;
+      case 'sqrt': return Math.sign(v) * Math.sqrt(Math.abs(v));
+    }
+  }
+  /** Axis units → value. */
+  private fromU(u: number) {
+    switch (this.xScale) {
+      case 'log': return 2 ** u;
+      case 'linear': return u;
+      case 'sqrt': return Math.sign(u) * u * u;
+    }
+  }
+  private uOfEv(ev: number) {
+    return this.xScale === 'log' ? ev : this.toU(2 ** ev);
+  }
+  /** Axis units → log2 of the value; -Infinity where the value is 0 or negative. */
+  private evOfU(u: number) {
+    if (this.xScale === 'log') return u;
+    const v = this.fromU(u);
+    return v > 0 ? Math.log2(v) : -Infinity;
+  }
+  /** log2 of the value under x, kept finite (for window edits; the window is clamped to the data anyway). */
+  private evAtX(x: number) {
+    return Math.max(this.evOfU(this.uAt(x)), (this.range?.[0] ?? EV_ORIGIN) - 1);
+  }
+  /** Smallest/largest view span and how far the view may go, in axis units. */
+  private limits() {
+    if (this.xScale === 'log') return { min: MIN_SPAN, max: MAX_SPAN, lo: EV_ORIGIN, hi: EV_END };
+    const e = this.extent[1] - this.extent[0];
+    return { min: e * 1e-6, max: e * 3, lo: this.extent[0] - e, hi: this.extent[1] + e };
   }
 
   private focus: [number, number] = [-10, 10];
@@ -160,20 +247,23 @@ export class HistogramView {
   private get width() {
     return this.main.clientWidth;
   }
-  private evAt(x: number) {
+  /** Axis units at canvas x. */
+  private uAt(x: number) {
     return this.v0 + (x / this.width) * (this.v1 - this.v0);
   }
-  private xAt(ev: number) {
-    return ((ev - this.v0) / (this.v1 - this.v0)) * this.width;
+  /** Canvas x of axis units u. */
+  private xAt(u: number) {
+    return ((u - this.v0) / (this.v1 - this.v0)) * this.width;
   }
 
   private setView(v0: number, v1: number) {
-    let span = Math.min(MAX_SPAN, Math.max(MIN_SPAN, v1 - v0));
+    const lim = this.limits();
+    const span = Math.min(lim.max, Math.max(lim.min, v1 - v0));
     const c = (v0 + v1) / 2;
     v0 = c - span / 2;
     v1 = c + span / 2;
-    if (v0 < EV_ORIGIN) [v0, v1] = [EV_ORIGIN, EV_ORIGIN + span];
-    if (v1 > EV_END) [v0, v1] = [EV_END - span, EV_END];
+    if (v0 < lim.lo) [v0, v1] = [lim.lo, lim.lo + span];
+    if (v1 > lim.hi) [v0, v1] = [lim.hi - span, lim.hi];
     this.v0 = v0;
     this.v1 = v1;
     this.redraw();
@@ -196,7 +286,7 @@ export class HistogramView {
     };
 
     const hitTest = (x: number, y: number, shift: boolean): Drag['kind'] => {
-      const loX = this.xAt(this.display.lo), hiX = this.xAt(this.display.hi);
+      const loX = this.xAt(this.uOfEv(this.display.lo)), hiX = this.xAt(this.uOfEv(this.display.hi));
       if (shift) return 'select';
       if (Math.abs(x - loX) <= EDGE_GRAB && Math.abs(x - loX) <= Math.abs(x - hiX)) return 'lo';
       if (Math.abs(x - hiX) <= EDGE_GRAB) return 'hi';
@@ -211,7 +301,7 @@ export class HistogramView {
       if (e.button !== 0) return;
       const { x, y } = local(e);
       const kind = hitTest(x, y, e.shiftKey);
-      const ev = this.evAt(x);
+      const ev = this.evAtX(x);
       el.setPointerCapture(e.pointerId);
       switch (kind) {
         case 'pan': this.drag = { kind, startX: x, v0: this.v0, v1: this.v1 }; el.style.cursor = 'grabbing'; break;
@@ -227,7 +317,7 @@ export class HistogramView {
       if (!d) {
         el.style.cursor = cursorFor[hitTest(x, y, e.shiftKey)];
       } else {
-        const ev = this.evAt(x);
+        const ev = this.evAtX(x);
         switch (d.kind) {
           case 'pan': {
             const dEv = ((x - d.startX) / this.width) * (d.v1 - d.v0);
@@ -271,9 +361,10 @@ export class HistogramView {
         const dEv = (e.deltaX / this.width) * span;
         this.setView(this.v0 + dEv, this.v1 + dEv);
       } else {
-        const anchor = this.evAt(x);
+        const anchor = this.uAt(x);
         const k = Math.exp(e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0025));
-        const newSpan = Math.min(MAX_SPAN, Math.max(MIN_SPAN, span * k));
+        const lim = this.limits();
+        const newSpan = Math.min(lim.max, Math.max(lim.min, span * k));
         const f = x / this.width;
         this.setView(anchor - f * newSpan, anchor + (1 - f) * newSpan);
       }
@@ -288,10 +379,17 @@ export class HistogramView {
       this.cb.onHover(null);
       return;
     }
-    // Highlight what sits under the cursor: ±3 CSS px, at least one bin.
-    const half = Math.max(1 / (2 * BINS_PER_STOP), ((this.v1 - this.v0) / this.width) * 3);
-    const ev = this.evAt(this.hoverX);
-    this.cb.onHover([ev - half, ev + half]);
+    // Highlight what sits under the cursor: ±3 CSS px (log axis: at least one bin).
+    const halfU = ((this.v1 - this.v0) / this.width) * 3;
+    const u = this.uAt(this.hoverX);
+    if (this.xScale === 'log') {
+      const half = Math.max(1 / (2 * BINS_PER_STOP), halfU);
+      this.cb.onHover([u - half, u + half]);
+    } else {
+      // Values at or below zero have no log2; the renderer treats -1e9 as "all of them".
+      const a = this.evOfU(u - halfU), b = this.evOfU(u + halfU);
+      this.cb.onHover(b === -Infinity ? null : [Math.max(-1e9, a), b]);
+    }
   }
 
   // ---------- interaction: overview ----------
@@ -299,8 +397,8 @@ export class HistogramView {
   private bindOverview() {
     const el = this.overview;
     const W = () => el.clientWidth;
-    const evAt = (x: number) => this.extent[0] + (x / W()) * (this.extent[1] - this.extent[0]);
-    const xAt = (ev: number) => ((ev - this.extent[0]) / (this.extent[1] - this.extent[0])) * W();
+    const uAt = (x: number) => this.extent[0] + (x / W()) * (this.extent[1] - this.extent[0]);
+    const xAt = (u: number) => ((u - this.extent[0]) / (this.extent[1] - this.extent[0])) * W();
     const localX = (e: PointerEvent) => e.clientX - el.getBoundingClientRect().left;
     const hit = (x: number) => {
       const a = xAt(this.v0), b = xAt(this.v1);
@@ -319,7 +417,7 @@ export class HistogramView {
         if (x < a || x > b) {
           // Jump: center the view where the user clicked.
           const span = this.v1 - this.v0;
-          const c = evAt(x);
+          const c = uAt(x);
           this.setView(c - span / 2, c + span / 2);
         }
         this.drag = { kind, startX: x, v0: this.v0, v1: this.v1 };
@@ -334,14 +432,14 @@ export class HistogramView {
         el.style.cursor = hit(x) === 'ov-pan' ? 'grab' : 'ew-resize';
         return;
       }
-      const ev = evAt(x);
+      const u = uAt(x), minSpan = this.limits().min;
       if (d.kind === 'ov-pan') {
         const dEv = ((x - d.startX) / W()) * (this.extent[1] - this.extent[0]);
         this.setView(d.v0 + dEv, d.v1 + dEv);
       } else if (d.kind === 'ov-lo') {
-        this.setView(Math.min(ev, this.v1 - MIN_SPAN), this.v1);
+        this.setView(Math.min(u, this.v1 - minSpan), this.v1);
       } else if (d.kind === 'ov-hi') {
-        this.setView(this.v0, Math.max(ev, this.v0 + MIN_SPAN));
+        this.setView(this.v0, Math.max(u, this.v0 + minSpan));
       }
     });
     const end = (e: PointerEvent) => {
@@ -355,10 +453,80 @@ export class HistogramView {
 
   // ---------- density ----------
 
-  /** Counts per bin (1/BINS_PER_STOP stop) averaged over [ev0, ev1). */
-  private density(cum: Float64Array, ev0: number, ev1: number) {
-    const a = evToBin(ev0), b = evToBin(ev1);
-    return (cumAt(cum, b) - cumAt(cum, a)) / Math.max(1e-9, b - a);
+  /**
+   * Finite values of channel k below the value v. Exact for RAW photosites (zero and negatives
+   * included). Binned data only places positive values, interpolating inside a log2 bin;
+   * its zeros and negatives count as lying below any positive v.
+   */
+  private below(k: ChannelKey, v: number) {
+    const ex = this.exact[k];
+    if (ex) return exactBelow(ex, v);
+    const st = this.stats[k]!;
+    // Negatives can't be placed, so they sit "at −∞": counted as below, never drawn.
+    if (v <= 0) return st.neg;
+    return st.neg + st.zero + cumAt(this.cum[k]!, evToBin(Math.log2(v)));
+  }
+
+  /** Values of channel k per axis unit over [u0, u1) (per stop on the log axis). */
+  private density(k: ChannelKey, u0: number, u1: number) {
+    return (this.below(k, this.fromU(u1)) - this.below(k, this.fromU(u0))) / Math.max(1e-300, u1 - u0);
+  }
+
+  /**
+   * Axis ticks as values. Log: a power-of-two grid from the grid origin (RAW: black + 1, 2, 4 …
+   * DN). Linear/sqrt: round numbers in what the label shows (RAW: green DN, else the value).
+   */
+  private ticks(w: number): { v: number; major: boolean; fine?: boolean }[] {
+    if (this.xScale === 'log') {
+      const pxPerStop = w / (this.v1 - this.v0);
+      const step = [1 / 16, 1 / 8, 1 / 4, 1 / 2, 1, 2, 5, 10, 20, 50].find((s) => s * pxPerStop >= 64) ?? 50;
+      const origin = gridOrigin();
+      const out = [];
+      for (let i = Math.ceil((this.v0 - origin) / step); i * step <= this.v1 - origin; i++) {
+        out.push({ v: 2 ** (i * step + origin), major: i === 0, fine: step < 1 });
+      }
+      return out;
+    }
+    const raw = rawReadout();
+    const toL = (v: number) => (raw ? raw.black + v * raw.range : v);
+    const fromL = (l: number) => (raw ? (l - raw.black) / raw.range : l);
+    const nice = (x: number) => {
+      if (!(x > 0)) return 1;
+      const p = 10 ** Math.floor(Math.log10(x));
+      return [1, 2, 5, 10].map((m) => m * p).find((m) => m >= x)!;
+    };
+    const lAtX = (x: number) => toL(this.fromU(this.uAt(x)));
+    const GAP = 90;
+    const ls: number[] = [];
+    if (this.xScale === 'linear') {
+      const step = nice(Math.abs(lAtX(GAP) - lAtX(0)));
+      for (let i = Math.ceil(lAtX(0) / step); i * step <= lAtX(w); i++) ls.push(i * step);
+    } else {
+      // Square root: spacing varies, so round closely spaced positions to local round numbers;
+      // the overlap pass below thins them out.
+      for (let x = 0; x <= w; x += GAP / 3) {
+        const step = nice(Math.abs(lAtX(x + GAP) - lAtX(x)) / 2);
+        ls.push(Math.round(lAtX(x) / step) * step);
+      }
+    }
+    ls.push(toL(0)); // zero: black for RAW
+    const ticks: { v: number; major: boolean; x: number }[] = [];
+    for (const l of [...new Set(ls)]) {
+      const v = fromL(l), x = this.xAt(this.toU(v));
+      if (x >= -1 && x <= w + 1) ticks.push({ v, major: Math.abs(v) < 1e-12, x });
+    }
+    ticks.sort((a, b) => a.x - b.x);
+    // Keep labels apart; zero (black) wins over its neighbors.
+    const kept: typeof ticks = [];
+    for (const t of ticks) {
+      const prev = kept[kept.length - 1];
+      if (prev && t.x - prev.x < 60) {
+        if (t.major) kept[kept.length - 1] = t;
+        continue;
+      }
+      kept.push(t);
+    }
+    return kept;
   }
 
   private yMap(d: number, max: number) {
@@ -396,34 +564,29 @@ export class HistogramView {
     // Window lane: what each EV turns into on screen.
     this.drawLane(g, w, p);
 
-    // Grid + ticks.
-    const pxPerStop = w / (this.v1 - this.v0);
-    const step = [1 / 16, 1 / 8, 1 / 4, 1 / 2, 1, 2, 5, 10, 20, 50].find((s) => s * pxPerStop >= 64) ?? 50;
+    // Grid + ticks; the brighter line marks the origin (log: the grid origin, else zero / black).
     g.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
     g.textAlign = 'center';
     g.textBaseline = 'top';
-    // Ticks fall on a power-of-two grid from the grid origin; the brighter line marks the origin.
-    const origin = gridOrigin();
-    for (let s = Math.ceil((this.v0 - origin) / step) * step; s <= this.v1 - origin; s += step) {
-      const ev = s + origin;
-      const x = Math.round(this.xAt(ev)) + 0.5;
-      g.strokeStyle = Math.abs(s) < 1e-9 ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.07)';
+    for (const t of this.ticks(w)) {
+      const x = Math.round(this.xAt(this.toU(t.v))) + 0.5;
+      g.strokeStyle = t.major ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.07)';
       g.beginPath();
       g.moveTo(x, plotTop);
       g.lineTo(x, plotBottom);
       g.stroke();
       g.fillStyle = 'rgba(220,220,220,0.85)';
-      if (SHOW_STOPS) {
-        g.fillText(fmtStops(ev, step < 1 ? 3 : 0), x, plotBottom + 4);
+      if (SHOW_STOPS && t.v > 0) {
+        g.fillText(fmtStops(Math.log2(t.v), t.fine ? 3 : 0), x, plotBottom + 4);
         g.fillStyle = 'rgba(160,160,160,0.75)';
-        g.fillText(fmtLinear(2 ** ev), x, plotBottom + 17);
+        g.fillText(fmtLinear(t.v), x, plotBottom + 17);
       } else if (rawReadout()) {
-        // RAW: the raw integer, and below it the ratio to the white level.
-        g.fillText(fmtLinear(2 ** ev), x, plotBottom + 4);
+        // RAW: the raw integer (green), and below it the ratio to the white level.
+        g.fillText(fmtLinear(t.v), x, plotBottom + 4);
         g.fillStyle = 'rgba(160,160,160,0.75)';
-        g.fillText(fmtValue(2 ** ev), x, plotBottom + 17);
+        g.fillText(fmtValue(t.v), x, plotBottom + 17);
       } else {
-        g.fillText(fmtValue(2 ** ev), x, plotBottom + 4);
+        g.fillText(fmtValue(t.v), x, plotBottom + 4);
       }
     }
 
@@ -433,13 +596,12 @@ export class HistogramView {
     const dens: Record<string, Float64Array> = {};
     let max = 0;
     for (const k of keys) {
-      const cum = this.cum[k]!;
       const arr = new Float64Array(cols);
       for (let c = 0; c < cols; c++) {
         const e0 = this.v0 + (c / cols) * (this.v1 - this.v0);
         const e1 = this.v0 + ((c + 1) / cols) * (this.v1 - this.v0);
         // Each channel as a share of its own values, so photosite channels compare fairly.
-        arr[c] = this.density(cum, e0, e1) * (this.total / this.totals[k]!);
+        arr[c] = this.density(k, e0, e1) * (this.total / this.totals[k]!);
         if (arr[c] > max) max = arr[c];
       }
       dens[k] = arr;
@@ -464,7 +626,7 @@ export class HistogramView {
     }
 
     // Shade outside the window.
-    const loX = this.xAt(p.lo), hiX = this.xAt(p.hi);
+    const loX = this.xAt(this.uOfEv(p.lo)), hiX = this.xAt(this.uOfEv(p.hi));
     g.fillStyle = 'rgba(0,0,0,0.45)';
     if (loX > 0) g.fillRect(0, plotTop, Math.min(w, loX), plotH);
     if (hiX < w) g.fillRect(Math.max(0, hiX), plotTop, w - Math.max(0, hiX), plotH);
@@ -481,9 +643,10 @@ export class HistogramView {
     // Reference markers (RAW white level, noise floor, ...).
     g.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
     g.textBaseline = 'top';
-    let labelRow = 0;
+    // Each label goes on the first row where it doesn't overlap the previous label there.
+    const rowEnds: number[] = [];
     for (const m of [...this.markers].sort((a, b) => a.ev - b.ev)) {
-      const x = Math.round(this.xAt(m.ev)) + 0.5;
+      const x = Math.round(this.xAt(this.uOfEv(m.ev))) + 0.5;
       if (x < 0 || x > w) continue;
       g.strokeStyle = m.color;
       g.lineWidth = 1;
@@ -496,8 +659,12 @@ export class HistogramView {
       g.fillStyle = m.color;
       const tw = g.measureText(m.label).width;
       const right = x + 3 + tw > w;
-      g.textAlign = right ? 'right' : 'left';
-      g.fillText(m.label, right ? x - 3 : x + 3, plotTop + 18 + 12 * (labelRow++ % 3));
+      const x0 = right ? x - 3 - tw : x + 3;
+      let row = rowEnds.findIndex((end) => end < x0 - 4);
+      if (row < 0) row = rowEnds.length;
+      rowEnds[row] = x0 + tw;
+      g.textAlign = 'left';
+      g.fillText(m.label, x0, plotTop + 18 + 12 * row);
     }
     g.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
 
@@ -505,8 +672,8 @@ export class HistogramView {
     if (this.probe) {
       for (const k of ['L', 'R', 'G', 'B'] as ChannelKey[]) {
         const v = this.probe[k];
-        if (v === undefined || !(v > 0) || !Number.isFinite(v)) continue;
-        const x = this.xAt(Math.log2(v));
+        if (v === undefined || !Number.isFinite(v) || (this.xScale === 'log' && !(v > 0))) continue;
+        const x = this.xAt(this.toU(v));
         if (x < 0 || x > w) continue;
         g.strokeStyle = CHANNEL_STYLE[k].stroke;
         g.lineWidth = k === 'L' ? 2 : 1.5;
@@ -533,7 +700,7 @@ export class HistogramView {
     g.textAlign = 'left';
     g.textBaseline = 'top';
     g.fillStyle = 'rgba(200,200,200,0.7)';
-    const peakPct = (max * BINS_PER_STOP / this.total) * 100;
+    const peakPct = (max / this.total) * 100; // per stop on the log axis
     const peak = `peak ${peakPct < 0.01 ? peakPct.toExponential(1) : peakPct.toPrecision(3)}% / stop · `;
     g.fillText(`${SHOW_STOPS ? peak : ''}${this.yScale}`, 6, plotTop + 4);
     const s = this.stats.L!;
@@ -559,7 +726,7 @@ export class HistogramView {
     const lut = colormapLut(p.mode === 'false' ? p.colormap : 'gray');
     const img = g.createImageData(Math.max(1, Math.round(w)), 1);
     for (let x = 0; x < img.width; x++) {
-      const ev = this.evAt(x + 0.5);
+      const ev = this.evOfU(this.uAt(x + 0.5));
       const t = evToDisplayT(ev, p);
       let rgb: readonly number[];
       if (t < 0) rgb = p.clip ? CLIP_COLORS.under.map((c) => c * 0.6) : [0, 0, 0];
@@ -580,7 +747,7 @@ export class HistogramView {
     g.drawImage(strip, 0, 0, w, LANE - 2);
 
     // Window label in the lane.
-    const loX = this.xAt(p.lo), hiX = this.xAt(p.hi);
+    const loX = this.xAt(this.uOfEv(p.lo)), hiX = this.xAt(this.uOfEv(p.hi));
     const label = fmtRange(p.lo, p.hi);
     g.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
     const tw = g.measureText(label).width + 10;
@@ -597,15 +764,14 @@ export class HistogramView {
     const { g, w, h } = this.prep(this.overview);
     g.fillStyle = '#101215';
     g.fillRect(0, 0, w, h);
-    const cum = this.cum.L;
-    if (!cum || !this.display) return;
+    if (!this.cum.L || !this.display) return;
     const [e0, e1] = this.extent;
     const xAt = (ev: number) => ((ev - e0) / (e1 - e0)) * w;
     const cols = Math.max(1, Math.round(w));
     const arr = new Float64Array(cols);
     let max = 0;
     for (let c = 0; c < cols; c++) {
-      arr[c] = this.density(cum, e0 + (c / cols) * (e1 - e0), e0 + ((c + 1) / cols) * (e1 - e0));
+      arr[c] = this.density('L', e0 + (c / cols) * (e1 - e0), e0 + ((c + 1) / cols) * (e1 - e0));
       max = Math.max(max, arr[c]);
     }
     g.fillStyle = 'rgba(200,200,200,0.45)';
@@ -615,7 +781,7 @@ export class HistogramView {
     }
     // Display window.
     g.fillStyle = 'rgba(255,176,46,0.16)';
-    const lx = xAt(this.display.lo), hx = xAt(this.display.hi);
+    const lx = xAt(this.uOfEv(this.display.lo)), hx = xAt(this.uOfEv(this.display.hi));
     g.fillRect(lx, 0, hx - lx, h);
     // Visible range.
     const a = xAt(this.v0), b = xAt(this.v1);
@@ -635,23 +801,39 @@ export class HistogramView {
       tip.hidden = true;
       return;
     }
-    const ev = this.evAt(x);
-    const half = ((this.v1 - this.v0) / this.width) * 3;
-    const lines = [
-      SHOW_STOPS ? `<b>${fmtLevel(ev)}</b> · ${fmtLinear(2 ** ev)}`
-        : rawReadout() ? `<b>${fmtLinear(2 ** ev)} DN</b> · ${fmtValue(2 ** ev)}`
-        : `<b>${fmtValue(2 ** ev)}</b>`,
-    ];
+    const u = this.uAt(x), v = this.fromU(u), ev = this.evOfU(u);
+    const halfU = ((this.v1 - this.v0) / this.width) * 3;
+    // The hovered pixel column covers values [a, b).
+    const a = this.fromU(this.uAt(Math.floor(x))), b = this.fromU(this.uAt(Math.floor(x) + 1));
+    const raw = rawReadout();
+    let head: string;
+    if (SHOW_STOPS && v > 0) head = `<b>${fmtLevel(ev)}</b> · ${fmtLinear(v)}`;
+    else if (raw) {
+      // Position on the axis: the value, and the green DN codes this pixel column spans.
+      const d0 = Math.ceil(raw.black + a * raw.range - 1e-9), d1 = Math.ceil(raw.black + b * raw.range - 1e-9) - 1;
+      const span = d1 < d0 ? 'between G codes' : d1 === d0 ? `G DN ${d0}` : `G DN ${d0}–${d1}`;
+      head = `<b>${fmtValue(v)}</b> × white · ${span}`;
+    } else head = `<b>${fmtValue(v)}</b>`;
+    const lines = [head];
     for (const k of ['L', 'R', 'G', 'B'] as ChannelKey[]) {
       if (!this.channels.has(k)) continue;
-      const cum = this.cum[k]!;
+      const st = this.stats[k]!;
       const total = this.totals[k]!;
-      const perStop = (this.density(cum, ev - half, ev + half) * BINS_PER_STOP / total) * 100;
-      const below = (cumAt(cum, evToBin(ev)) + this.stats[k]!.zero + this.stats[k]!.neg) / total * 100;
-      const density = SHOW_STOPS ? `${perStop.toPrecision(3)}%/stop · ` : '';
-      lines.push(`<span class="k k${k}">${k}</span> ${density}${below.toFixed(2)}% below`);
+      const perStop = (this.density(k, u - halfU, u + halfU) / total) * 100;
+      const below = (this.below(k, a) / total) * 100;
+      const density = SHOW_STOPS && this.xScale === 'log' ? `${perStop.toPrecision(3)}%/stop · ` : '';
+      // Exact channels also count what lies in this column and above it, so a single photosite shows.
+      let here = '';
+      if (this.exact[k]) {
+        const at = this.below(k, b) - this.below(k, a);
+        const above = st.pos + st.zero + st.neg - this.below(k, b);
+        here = ` · ${at.toLocaleString()} here · ${above.toLocaleString()} above`;
+      }
+      // Binned data can't place its negatives, so left of zero it only knows the share at or below 0.
+      const where = !this.exact[k] && a <= 0 ? `${(((st.neg + (a === 0 ? 0 : st.zero)) / total) * 100).toFixed(2)}% ≤ 0 (negatives not placed)` : `${below.toFixed(below > 99.99 && below < 100 ? 4 : 2)}% below`;
+      lines.push(`<span class="k k${k}">${k === 'L' ? 'Y' : k}</span> ${density}${where}${here}`);
     }
-    const near = this.markers.filter((m) => Math.abs(this.xAt(m.ev) - x) <= 4);
+    const near = this.markers.filter((m) => Math.abs(this.xAt(this.uOfEv(m.ev)) - x) <= 4);
     for (const m of near) lines.push(`<span style="color:${m.color}">${m.title ?? m.label}</span>`);
     tip.innerHTML = lines.join('<br>');
     tip.hidden = false;

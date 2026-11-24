@@ -15,6 +15,7 @@
       <button id="demo" title="Load a synthetic test image">Demo</button>
       <span id="filename" class="filename"></span>
       <select id="part" title="Part" hidden></select>
+      <span id="layer-label" class="tb-label" hidden>Input</span>
       <select id="layer" title="Layer / channels (RAW: how sensor values become RGB)" hidden></select>
       <select id="sensor" title="RAW sensor view (M): photosite mosaic or demosaiced image" hidden>
         <option value="auto">Mosaic when zoomed in</option>
@@ -25,10 +26,11 @@
 
       <div class="group">
         <div class="seg" id="mode" role="radiogroup" aria-label="Display mode">
-          <button data-v="log" title="Log mapping of the window (1)">Log</button>
-          <button data-v="linear" title="Linear mapping, sRGB-encoded (2)">Linear</button>
-          <button data-v="false" title="False color (3)">False color</button>
+          <button data-v="log" title="log2 of the value, spread linearly across the window: every stop gets the same width. Not a camera log curve. (1)">Log₂</button>
+          <button data-v="linear" title="Linear scaling of the window, then the selected display encoding (2)">Linear</button>
+          <button data-v="false" title="False color: log2 of the value through a colormap (3)">False color</button>
         </div>
+        <select id="transfer" title="Display encoding for Linear mode (the canvas is treated as an sRGB display)"></select>
         <select id="colormap" title="Colormap">
           <option value="turbo">Turbo</option>
           <option value="viridis">Viridis</option>
@@ -41,7 +43,7 @@
       <div class="group">
         <select id="channel" title="Channel">
           <option value="rgb">RGB</option>
-          <option value="l">Luminance</option>
+          <option value="l">Luminance (Y)</option>
           <option value="r">R</option>
           <option value="g">G</option>
           <option value="b">B</option>
@@ -80,13 +82,20 @@
     <section class="hist" id="hist-panel">
       <div class="hist-resize" id="hist-resize" title="Drag to resize"></div>
       <div class="hist-controls">
+        <span class="tb-label" title="Histogram x axis: the value">x</span>
+        <div class="seg small" id="xscale" aria-label="Histogram X scale">
+          <button data-v="log" title="log2 of the value: every stop gets the same width">Log₂</button>
+          <button data-v="linear" title="The value itself: every DN gets the same width (RAW), and values at or below black show">Lin</button>
+          <button data-v="sqrt" title="Square root of the value: photon shot noise looks about equally wide at every level">Sqrt</button>
+        </div>
+        <span class="tb-label" title="Histogram y axis: the count">count</span>
         <div class="seg small" id="yscale" aria-label="Histogram Y scale">
           <button data-v="linear">Lin</button>
           <button data-v="sqrt">Sqrt</button>
           <button data-v="log">Log</button>
         </div>
         <div class="chan-toggles" id="hist-channels">
-          <button data-v="L" class="kL">L</button>
+          <button data-v="L" class="kL" title="Relative luminance Y">Y</button>
           <button data-v="R" class="kR">R</button>
           <button data-v="G" class="kG">G</button>
           <button data-v="B" class="kB">B</button>

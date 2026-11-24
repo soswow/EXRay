@@ -5,7 +5,7 @@ import { canDecodeNatively, decodeNative } from './exr-decode';
 import { HistogramAccumulator } from './histogram';
 import { makeDemoImage } from './demo';
 import { decodeRaw, isExr } from './raw-decode';
-import type { ChannelHistogram, ChannelKey, DecodedImage, ExrPart, RawModeId, WorkerRequest, WorkerResponse } from './types';
+import type { ChannelHistogram, ChannelKey, DecodedImage, ExrPart, RawModeId, RawOptions, WorkerRequest, WorkerResponse } from './types';
 
 // Typed view of the worker global, without pulling the WebWorker lib into the DOM build.
 const ctx = self as unknown as {
@@ -16,7 +16,7 @@ const ctx = self as unknown as {
 ctx.onmessage = async (e) => {
   try {
     const req = e.data;
-    const image = req.type === 'demo' ? demo() : await decode(req.buffer, req.name, req.part, req.layer);
+    const image = req.type === 'demo' ? demo() : await decode(req.buffer, req.name, req.part, req.layer, req.rawOptions);
     const transfer: Transferable[] = [image.data.buffer];
     if (image.raw) transfer.push(image.raw.dn.buffer);
     for (const k of Object.keys(image.histograms) as ChannelKey[]) transfer.push(image.histograms[k].bins.buffer);
@@ -26,8 +26,8 @@ ctx.onmessage = async (e) => {
   }
 };
 
-async function decode(buffer: ArrayBuffer, name: string, part: number, layerId?: string): Promise<DecodedImage> {
-  if (!isExr(buffer)) return decodeRawImage(buffer, name, (layerId as RawModeId | undefined) ?? 'cam');
+async function decode(buffer: ArrayBuffer, name: string, part: number, layerId?: string, rawOptions?: Partial<RawOptions>): Promise<DecodedImage> {
+  if (!isExr(buffer)) return decodeRawImage(buffer, name, (layerId as RawModeId | undefined) ?? 'cam', rawOptions);
   const layout = parseExrLayout(buffer);
   const parts = layout.parts;
   const header: ExrPart | undefined = parts[part];
@@ -91,9 +91,9 @@ async function decode(buffer: ArrayBuffer, name: string, part: number, layerId?:
   };
 }
 
-async function decodeRawImage(buffer: ArrayBuffer, name: string, mode: RawModeId): Promise<DecodedImage> {
+async function decodeRawImage(buffer: ArrayBuffer, name: string, mode: RawModeId, rawOptions?: Partial<RawOptions>): Promise<DecodedImage> {
   const t0 = performance.now();
-  const r = await decodeRaw(buffer, name, mode);
+  const r = await decodeRaw(buffer, name, mode, rawOptions);
   const t1 = performance.now();
   const histograms = buildHistograms(r.data, r.width * r.height, r.lumaWeights, r.photositeHistograms);
   const t2 = performance.now();

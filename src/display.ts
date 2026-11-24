@@ -4,11 +4,28 @@ import { gridFloor } from './format';
 /**
  * How float values become display colors. The window [lo, hi] is in log2 of the value
  * (see SHOW_STOPS in format.ts for how the UI presents it).
- *  - log:    t = (log2(v) - lo) / (hi - lo), shown directly. Compresses any range to the screen.
- *  - linear: t = (v - 2^lo) / (2^hi - 2^lo), then sRGB-encoded. Like an exposure + black point.
+ *  - log:    t = (log2(v) - lo) / (hi - lo), sent to the display as is: every stop in the window
+ *            gets the same width. A plain log2, not a camera log curve (LogC, S-Log, ...).
+ *  - linear: t = (v - 2^lo) / (2^hi - 2^lo), then encoded with `transfer`. Like an exposure + black point.
  *  - false:  log t of the selected channel (luminance for RGB) through a colormap.
+ * The canvas is treated as an sRGB display; there is no color management beyond that.
  */
 export type DisplayMode = 'log' | 'linear' | 'false';
+
+/**
+ * Encoding for linear mode, i.e. the inverse of the display's EOTF.
+ *  - srgb:   IEC 61966-2-1 piecewise curve
+ *  - bt1886: 1 / 2.4 power (inverse of the BT.1886 EOTF with zero black)
+ *  - g22:    1 / 2.2 power
+ *  - none:   linear values written straight to the display
+ */
+export type Transfer = 'srgb' | 'bt1886' | 'g22' | 'none';
+export const TRANSFERS: { id: Transfer; label: string; title: string }[] = [
+  { id: 'srgb', label: 'sRGB', title: 'IEC 61966-2-1 piecewise sRGB encoding' },
+  { id: 'bt1886', label: 'BT.1886 (γ 2.4)', title: 'Inverse of the BT.1886 display EOTF: a 1/2.4 power' },
+  { id: 'g22', label: 'γ 2.2', title: 'A pure 1/2.2 power' },
+  { id: 'none', label: 'None (linear)', title: 'Linear values written to the display unencoded' },
+];
 export type ViewChannel = 'rgb' | 'r' | 'g' | 'b' | 'l' | 'a';
 
 export interface DisplayParams {
@@ -17,6 +34,8 @@ export interface DisplayParams {
   lo: number;
   hi: number;
   colormap: ColormapId;
+  /** Encoding applied in linear mode. */
+  transfer: Transfer;
   /** Quantize false color into one band per power of two, aligned to the grid origin (format.ts). */
   bands: boolean;
   /** Mark out-of-window and special values with solid colors. */
@@ -57,12 +76,21 @@ export function clampWindow(lo: number, hi: number, range: [number, number] | nu
 export const srgbEncode = (x: number) =>
   x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1 / 2.4) - 0.055;
 
+export function encode(x: number, t: Transfer): number {
+  switch (t) {
+    case 'srgb': return srgbEncode(x);
+    case 'bt1886': return Math.pow(x, 1 / 2.4);
+    case 'g22': return Math.pow(x, 1 / 2.2);
+    case 'none': return x;
+  }
+}
+
 /** Display intensity (0..1, may fall outside) for a value with the given log2. */
 export function evToDisplayT(ev: number, p: DisplayParams): number {
   if (p.mode === 'linear') {
     const a = 2 ** p.lo, b = 2 ** p.hi;
     const t = (2 ** ev - a) / (b - a);
-    return t < 0 || t > 1 ? t : srgbEncode(t);
+    return t < 0 || t > 1 ? t : encode(t, p.transfer);
   }
   const e = p.mode === 'false' && p.bands ? gridFloor(ev) + 0.5 : ev;
   return (e - p.lo) / (p.hi - p.lo);

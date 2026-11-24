@@ -151,3 +151,58 @@ export function percentileEv(cum: Float64Array, fraction: number): number {
   const frac = inBin > 0 ? (target - cum[lo]) / inBin : 0;
   return binToEv(lo + frac);
 }
+
+/**
+ * Exact histogram of values that take few distinct values (RAW photosites): `values[i]` occurs
+ * `counts[i]` times. Values need not be sorted or distinct. `exact` keeps every finite value,
+ * including zero and negatives (below black), so a linear axis can show them. The log2 bins hold
+ * the positive ones, so code that only knows bins still works.
+ */
+export function exactHistogram(values: Float64Array, counts: Float64Array): ChannelHistogram {
+  const order = Array.from(values.keys()).sort((a, b) => values[a] - values[b]);
+  const stats = emptyStats();
+  const bins = new Uint32Array(NUM_BINS);
+  const fv: number[] = [], fc: number[] = [];
+  for (const i of order) {
+    const v = values[i], n = counts[i];
+    if (!n) continue;
+    if (Number.isNaN(v)) {
+      stats.nan += n;
+      continue;
+    }
+    if (!Number.isFinite(v)) {
+      stats.inf += n;
+      continue;
+    }
+    if (v === 0) stats.zero += n;
+    else if (v < 0) {
+      stats.neg += n;
+      if (v < stats.minNeg) stats.minNeg = v;
+    } else {
+      stats.pos += n;
+      if (!stats.minPos) stats.minPos = v;
+      stats.maxPos = v;
+      bins[Math.floor((Math.log2(v) - EV_ORIGIN) * BINS_PER_STOP)] += n;
+    }
+    if (fv.length && fv[fv.length - 1] === v) fc[fc.length - 1] += n;
+    else {
+      fv.push(v);
+      fc.push(n);
+    }
+  }
+  const cum = new Float64Array(fv.length + 1);
+  for (let i = 0; i < fv.length; i++) cum[i + 1] = cum[i] + fc[i];
+  return { bins, stats, exact: { values: Float64Array.from(fv), cum } };
+}
+
+/** Number of finite values below `v` (strictly), from an exact distribution. */
+export function exactBelow(exact: { values: Float64Array; cum: Float64Array }, v: number): number {
+  const a = exact.values;
+  let lo = 0, hi = a.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (a[mid] < v) lo = mid + 1;
+    else hi = mid;
+  }
+  return exact.cum[lo];
+}

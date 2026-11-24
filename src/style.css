@@ -73,6 +73,7 @@ input[type='checkbox'] { height: auto; accent-color: var(--accent); margin: 0 5p
 .filename { color: var(--muted); max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .spacer { flex: 1; }
 .group { display: flex; align-items: center; gap: 8px; padding-left: 8px; border-left: 1px solid var(--border); }
+.tb-label { color: var(--muted); }
 .check { display: inline-flex; align-items: center; color: var(--muted); cursor: pointer; user-select: none; white-space: nowrap; }
 .check:has(input:checked) { color: var(--text); }
 
@@ -154,7 +155,7 @@ input[type='checkbox'] { height: auto; accent-color: var(--accent); margin: 0 5p
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .info {
-  width: 320px;
+  width: 380px;
   flex: none;
   overflow: auto;
   background: var(--panel);
@@ -239,3 +240,18 @@ input[type='checkbox'] { height: auto; accent-color: var(--accent); margin: 0 5p
   .info { position: absolute; right: 0; top: 0; bottom: 0; z-index: 4; width: min(320px, 90vw); }
   .workspace { position: relative; }
 }
+
+/* Probe: labels, and the photosite under the cursor. */
+.probe .ev { color: var(--muted); }
+.probe .here { background: rgba(255, 255, 255, 0.16); border-radius: 2px; }
+
+/* Info panel: tables of candidates with their sources; the one in use is highlighted. */
+.info table.src td:first-child { white-space: normal; }
+.info table.src tr[title] { cursor: help; }
+.info table.src tr.used td { color: var(--text); background: rgba(255, 176, 46, 0.14); }
+.info table.src tr.used td:first-child { color: var(--accent); }
+.info table.src tr.group td { color: var(--muted); font: 11px var(--sans); text-transform: uppercase; letter-spacing: 0.06em; padding-top: 8px; border-bottom: none; }
+.info table.src tr.detail td { color: var(--muted); font-size: 10px; border-bottom: none; padding-top: 0; }
+.info th.kR { color: #ff7a7a; } .info th.kG { color: #7ae68a; } .info th.kB { color: #85a8ff; }
+.info .pick { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 6px; color: var(--muted); font-size: 12px; align-items: center; }
+.info .pick select { height: 24px; padding: 1px 6px; font-size: 12px; max-width: 100%; }

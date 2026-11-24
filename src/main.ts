@@ -1,12 +1,12 @@
 import './style.css';
 import { colormapLut, type ColormapId } from './colormaps';
-import { clampWindow, type DisplayMode, type DisplayParams, type ViewChannel } from './display';
+import { clampWindow, TRANSFERS, type DisplayMode, type DisplayParams, type Transfer, type ViewChannel } from './display';
 import { pixelTypeName } from './exr-header';
-import { fmtBytes, fmtLevel, fmtLinear, fmtRange, fmtValue, escapeHtml, fromStops, gridCeil, gridFloor, inputToLevel, levelToInput, rawReadout, setRawReadout, SHOW_STOPS } from './format';
+import { fmtBytes, fmtLevel, fmtLinear, fmtRange, fmtValue, escapeHtml, fromStops, gridCeil, gridFloor, inputToLevel, levelToInput, setRawReadout, SHOW_STOPS } from './format';
 import { percentileEv } from './histogram';
-import { HistogramView, type HistMarker, type YScale } from './histogram-view';
+import { HistogramView, type HistMarker, type XScale, type YScale } from './histogram-view';
 import { Renderer } from './renderer';
-import { RAW_MODES, type ChannelKey, type DecodedImage, type RawImage, type WorkerRequest, type WorkerResponse } from './types';
+import { RAW_MODES, type ChannelKey, type DecodedImage, type LevelCandidate, type RawImage, type RawOptions, type WorkerRequest, type WorkerResponse } from './types';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -18,6 +18,7 @@ const params: DisplayParams = {
   lo: SHOW_STOPS ? fromStops(-6) : -8,
   hi: SHOW_STOPS ? fromStops(6) : 4,
   colormap: 'turbo',
+  transfer: 'srgb',
   bands: false,
   clip: true,
   isolate: false,
@@ -26,6 +27,8 @@ const params: DisplayParams = {
 let image: DecodedImage | null = null;
 /** Re-reads the current file so another part or layer can be decoded. */
 let reload: ((part: number, layer?: string) => Promise<void>) | null = null;
+/** RAW: which black/white levels and sensor area to use; empty means the defaults. */
+let rawOptions: Partial<RawOptions> = {};
 /** CSS px per image px, and CSS px offset of the image's top-left corner. */
 const view = { scale: 1, x: 0, y: 0 };
 let hover: [number, number] | null = null;
@@ -125,6 +128,7 @@ function decodeInWorker(req: WorkerRequest, transfer: Transferable[] = []): Prom
 
 async function load(name: string, getBuffer: () => Promise<ArrayBuffer>, part = 0, layer?: string, keepView = false) {
   showError(null);
+  if (!keepView) rawOptions = {};
   if (!keepView && image?.raw && image.byteSize > 80 * 2 ** 20) {
     // LibRaw's WebAssembly memory never shrinks. After a very large file, a fresh worker gives
     // it back (at the cost of compiling LibRaw again, so it isn't done after every file).
@@ -135,7 +139,7 @@ async function load(name: string, getBuffer: () => Promise<ArrayBuffer>, part = 
   try {
     const buffer = await getBuffer();
     setBusy(`Decoding ${name} (${fmtBytes(buffer.byteLength)})…`);
-    const img = await decodeInWorker({ type: 'decode', buffer, name, part, layer }, [buffer]);
+    const img = await decodeInWorker({ type: 'decode', buffer, name, part, layer, rawOptions }, [buffer]);
     reload = (p, l) => load(name, getBuffer, p, l, true);
     setImage(img, keepView);
   } catch (e) {
@@ -196,14 +200,16 @@ function setImage(img: DecodedImage, keepView: boolean) {
 
   const layers = img.raw ? RAW_MODES : img.parts[img.part]?.layers ?? [];
   $('sensor').hidden = img.raw?.kind !== 'cfa';
+  $('layer-label').hidden = !img.raw;
+  if (img.raw) rawOptions = { ...img.raw.options };
   const layerSel = $<HTMLSelectElement>('layer');
   layerSel.hidden = layers.length < 2;
   layerSel.innerHTML = layers.map((l) => `<option value="${escapeHtml(l.id)}">${escapeHtml(l.label)}</option>`).join('');
   layerSel.value = img.layer;
   if (img.luminanceOnly && params.channel !== 'rgb' && params.channel !== 'l') params.channel = 'rgb';
 
-  // RAW files read out as raw integers, on the green channel's black level and range.
-  setRawReadout(img.raw ? { black: greenBlack(img.raw), range: img.raw.white - greenBlack(img.raw) } : null);
+  // RAW axis and window positions read out as green DN, on the green channel's black and white level.
+  setRawReadout(img.raw ? greenLevels(img.raw) : null);
   hist.markers = img.raw ? rawMarkers(img.raw) : [];
   $('win-auto').title = `Fit window to the ${img.raw ? '0.001–99.999' : '0.5–99.9'}% luminance percentiles (A)`;
   hist.setImage(img);
@@ -346,80 +352,102 @@ function coordLine(x: number, y: number) {
 
 function rawProbe(probe: HTMLElement, raw: RawImage, x: number, y: number, R: number, G: number, B: number, L: number) {
   const names = ['R', 'G', 'B', 'G2'];
-  const w = image!.width;
-  // Photosite under the cursor (mosaic files): its color and cell.
-  const cell = raw.kind === 'cfa' ? (y % raw.cellH) * raw.cellW + (x % raw.cellW) : -1;
-  const site = cell >= 0 ? raw.cellColor[cell] : -1;
-  const siteChannel = site === 3 ? 1 : site;
-
-  // Value → raw integer for channel c: DN = black + value / scale (scale includes white balance).
-  const cellOf = (c: number) => {
-    const i = raw.cellColor.findIndex((k) => k === c || (c === 1 && k === 3));
-    return Math.max(0, i);
-  };
-  const toDn = (c: number, v: number) => raw.cellBlack[cellOf(c)] + v / raw.cellScale[cellOf(c)];
-  const approx = raw.mode === '709';
-  // Fixed-width columns: label, DN, ratio. The header uses the same widths.
-  const cols = (label: string, dn: string, ratio: string) => [label.padEnd(2), dn.padStart(8), ratio.padStart(9)];
-  const row = (label: string, cls: string, dn: string, v: number, mark = '') => {
-    const [l, d, r] = cols(label, dn, Number.isFinite(v) ? v.toFixed(5) : fmtValue(v));
-    return `<span class="k${cls}">${l}</span> ${d} ${r}${mark}`;
-  };
-  const header = (dnLabel: string) => `<span class="ev">${cols('', dnLabel, 'ratio').join(' ')}</span>`;
-
-  const mosaic = mosaicShown() && cell >= 0;
+  const chOf = (c: number) => (c === 3 ? 1 : c);
+  const { width: w, height: h } = image!;
   const lines = [coordLine(x, y)];
-  if (mosaic) {
-    const dn = raw.dn[y * w + x];
-    const v = (dn - raw.cellBlack[cell]) * raw.cellScale[cell];
-    lines.push(`<span class="ev">${names[site].padEnd(2)} photosite</span>`, header('DN'));
-    lines.push(row(names[site], names[siteChannel], String(dn), v));
+  const val = (v: number) => (Number.isFinite(v) ? v.toFixed(5) : fmtValue(v)).padStart(9);
+
+  if (raw.kind === 'linear') {
+    // Three raw integers per pixel, nothing interpolated.
+    lines.push(`<span class="ev">   raw DN     value</span>`);
+    [R, G, B].forEach((v, c) => lines.push(`<span class="k${names[c]}">${names[c]}</span> ${String(raw.dn[(y * w + x) * 3 + c]).padStart(7)} ${val(v)}`));
+    lines.push(`<span class="kL">Y</span> ${''.padStart(7)} ${val(L)} <span class="ev">luminance</span>`);
     probe.innerHTML = lines.join('\n');
     probe.hidden = false;
-    hist.setProbe({ [names[siteChannel]]: v });
+    hist.setProbe({ R, G, B, L });
     return;
   }
-  lines.push(`<span class="ev">demosaiced${site >= 0 ? ` · ${names[site].padEnd(2)} photosite •` : ''}</span>`, header(approx ? 'DN≈' : 'DN'));
-  [R, G, B].forEach((v, c) => {
-    // The photosite's own channel is the exact raw integer; the others are interpolated.
-    const exact = c === siteChannel && !approx;
-    const dn = exact ? raw.dn[y * w + x] : raw.kind === 'linear' && !approx ? raw.dn[(y * w + x) * 3 + c] : toDn(c, v);
-    lines.push(row(names[c], names[c], dn.toFixed(1), v, exact ? ' <span class="ev">•</span>' : ''));
+
+  // The 3×3 photosites around the cursor, as raw integers in their own colors.
+  const cellAt = (xx: number, yy: number) => (yy % raw.cellH) * raw.cellW + (xx % raw.cellW);
+  lines.push('<span class="ev">photosites (raw DN)</span>');
+  for (let dy = -1; dy <= 1; dy++) {
+    const row: string[] = [];
+    for (let dx = -1; dx <= 1; dx++) {
+      const xx = x + dx, yy = y + dy;
+      if (xx < 0 || yy < 0 || xx >= w || yy >= h) {
+        row.push(' '.repeat(8));
+        continue;
+      }
+      const c = raw.cellColor[cellAt(xx, yy)];
+      const text = `${names[c].padEnd(2)}${String(raw.dn[yy * w + xx]).padStart(6)}`;
+      row.push(`<span class="k${names[chOf(c)]}${dx || dy ? '' : ' here'}">${text}</span>`);
+    }
+    lines.push(row.join(' '));
+  }
+  const cell = cellAt(x, y), site = raw.cellColor[cell];
+  const dn = raw.dn[y * w + x], black = raw.cellBlack[cell], white = raw.cellWhite[cell];
+  const v = (dn - black) * raw.cellScale[cell];
+  const wbNote = raw.mode === 'cam' ? '' : ` × WB ${raw.wb[chOf(site)].toFixed(3)}`;
+  lines.push(`<span class="ev">${names[site]}: (DN − ${fmtDnLevel(black)}) ÷ (${fmtDnLevel(white)} − ${fmtDnLevel(black)})${wbNote}</span>`);
+  lines.push(`<span class="k${names[chOf(site)]}">${names[site].padEnd(2)}</span> ${String(dn).padStart(6)} → ${v.toFixed(5)}`);
+
+  if (mosaicShown()) {
+    probe.innerHTML = lines.join('\n');
+    probe.hidden = false;
+    hist.setProbe({ [names[chOf(site)]]: v });
+    return;
+  }
+  // Demosaiced values: only the photosite's own channel is measured; the others are bilinear means.
+  const mixed = raw.mode === '709';
+  lines.push(`<span class="ev">demosaiced${mixed ? ', WB + rgb_cam' : ' (bilinear)'}</span>`);
+  [R, G, B].forEach((value, c) => {
+    const tag = mixed ? 'mixed' : c === chOf(site) ? 'photosite' : 'interpolated';
+    lines.push(`<span class="k${names[c]}">${names[c]} </span>${val(value)} <span class="ev">${tag}</span>`);
   });
-  const scale = rawReadout()!;
-  lines.push(row('L', 'L', (scale.black + L * scale.range).toFixed(1), L));
+  lines.push(`<span class="kL">Y </span>${val(L)} <span class="ev">luminance</span>`);
   probe.innerHTML = lines.join('\n');
   probe.hidden = false;
   hist.setProbe({ R, G, B, L });
 }
 
-/** Black level of the green channel (the one white balance leaves alone). */
-function greenBlack(raw: RawImage) {
-  const i = raw.cellColor.findIndex((c) => c === 1 || c === 3);
-  return raw.cellBlack[Math.max(0, i)];
+/** A black or white level: integers as is, measured means with two decimals. */
+const fmtDnLevel = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(2));
+
+/** Black level and range (white − black) of the green channel, which white balance leaves alone. */
+function greenLevels(raw: RawImage) {
+  const i = Math.max(0, raw.cellColor.findIndex((c) => c === 1 || c === 3));
+  return { black: raw.cellBlack[i], range: raw.cellWhite[i] - raw.cellBlack[i] };
 }
 
 /** Read-noise numbers for a RAW file, when the masked border allows an estimate. */
 function rawNoise(raw: RawImage) {
   if (!raw.noise) return null;
-  // Dynamic range runs up to where the sensor stops being linear, when the file says where that is.
-  const top = raw.linearMax && raw.linearMax < raw.white ? raw.linearMax : raw.white;
-  const range = raw.white - greenBlack(raw);
-  return { sigma: raw.noise.sigma, norm: raw.noise.sigma / range, dr: Math.log2((top - greenBlack(raw)) / raw.noise.sigma), top };
+  const { range } = greenLevels(raw);
+  return { sigma: raw.noise.sigma, norm: raw.noise.sigma / range, dr: Math.log2(range / raw.noise.sigma) };
 }
+
+const usedLabel = <T extends string>(list: LevelCandidate<T>[], id: T) => list.find((c) => c.id === id)?.label ?? id;
 
 /** Sensor reference levels on the histogram, in the normalized (green) scale. */
 function rawMarkers(raw: RawImage): HistMarker[] {
-  const range = raw.white - greenBlack(raw);
-  const m: HistMarker[] = [{ ev: 0, label: 'white', color: '#ff6b6b', title: `White level: ${raw.white} DN (${raw.bits}-bit)` }];
-  if (raw.linearMax && raw.linearMax < raw.white) {
-    m.push({ ev: Math.log2((raw.linearMax - greenBlack(raw)) / range), label: 'linear max', color: '#ffa94d', title: `Linear max: ${raw.linearMax} DN, the highest value the camera calls linear` });
-  }
+  const { black, range } = greenLevels(raw);
+  const whiteLabel = usedLabel(raw.whites, raw.options.white);
+  const m: HistMarker[] = [{ ev: 0, label: 'white', color: '#ff6b6b', title: `White level used: ${fmtDnLevel(black + range)} DN (${whiteLabel}) = 1.0` }];
+  const colors = ['#ffa94d', '#ffd43b', '#e599f7'];
+  raw.whites
+    .filter((c) => c.id !== raw.options.white && c.values[1] !== null && c.values[1]! > black && c.values[1] !== black + range)
+    .forEach((c, i) => m.push({
+      ev: Math.log2((c.values[1]! - black) / range),
+      label: c.label,
+      color: colors[i % colors.length],
+      title: `${c.label}: ${c.values[1]} DN (G). ${c.source}`,
+    }));
   if (raw.pattern !== 'demosaiced by LibRaw') {
     m.push({ ev: Math.log2(1 / range), label: '1 DN', color: '#74c0fc', title: 'One raw step above black: below this, values are quantized to single integers' });
   }
   const n = rawNoise(raw);
-  if (n) m.push({ ev: Math.log2(n.norm), label: 'read noise σ', color: '#b197fc', title: `Read noise ${n.sigma.toFixed(2)} DN from masked pixels: SNR 1 here, ${n.dr.toFixed(2)} stops below ${n.top === raw.white ? 'white' : 'linear max'}` });
+  if (n) m.push({ ev: Math.log2(n.norm), label: 'read noise σ', color: '#b197fc', title: `Read noise ${n.sigma.toFixed(2)} DN from masked pixels: SNR 1 here, ${n.dr.toFixed(2)} stops below white` });
   return m;
 }
 
@@ -444,14 +472,16 @@ function renderInfo() {
   }
   const img = image;
   const part = img.parts[img.part];
+  const raw = img.raw;
   const rows: string[] = [];
   const dl = (pairs: [string, string][]) =>
     `<dl>${pairs.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join('')}</dl>`;
 
+  const area = raw?.areas.find((a) => a.id === raw.options.crop);
   const fileInfo: [string, string][] = [
     ['Name', img.name],
     ['Size', fmtBytes(img.byteSize)],
-    ['Resolution', `${img.width} × ${img.height}`],
+    ['Resolution', `${img.width} × ${img.height}${area ? ` (${area.label})` : ''}`],
   ];
   if (part) {
     fileInfo.push(['Compression', part.compression]);
@@ -462,79 +492,75 @@ function renderInfo() {
     fileInfo.push(['Data window', `${x0},${y0} – ${x1},${y1}`]);
     if (x0 !== dx0 || y0 !== dy0 || x1 !== dx1 || y1 !== dy1) fileInfo.push(['Display window', `${dx0},${dy0} – ${dx1},${dy1}`]);
   }
-  fileInfo.push(['Luma weights', img.lumaWeights.map((v) => v.toFixed(4)).join(', ')]);
+  fileInfo.push(['Y coefficients', `${img.lumaWeights.map((v) => v.toFixed(4)).join(', ')} — ${lumaSource(img)}`]);
   fileInfo.push(['Decode', `${img.timings.decodeMs.toFixed(0)} ms · histogram ${img.timings.histMs.toFixed(0)} ms`]);
-  if (img.raw) fileInfo.push(['RAW timing', `LibRaw ${img.raw.timings.unpackMs ? `${img.raw.timings.unpackMs.toFixed(0)} ms` : 'cached'} · develop ${img.raw.timings.developMs.toFixed(0)} ms`]);
+  if (raw) fileInfo.push(['RAW timing', `LibRaw ${raw.timings.unpackMs ? `${raw.timings.unpackMs.toFixed(0)} ms` : 'cached'} · develop ${raw.timings.developMs.toFixed(0)} ms`]);
   rows.push('<h2>Image</h2>', dl(fileInfo));
-  const raw = img.raw;
-  if (raw) {
-    const blacks = [...new Set(raw.cellBlack)].map((b) => fmtValue(b)).join(' / ');
-    const rawInfo: [string, string][] = [
-      ['Sensor', `${raw.pattern}${raw.kind === 'cfa' ? ` (${raw.cellW}×${raw.cellH} cell)` : ''}`],
-      ['Black level', blacks],
-      ['White level', `${raw.white} (${raw.bits}-bit)${raw.linearMax && raw.linearMax !== raw.white ? ` · linear max ${raw.linearMax}` : ''}`],
-      ['Readouts', 'raw integers (DN); ratio = (DN − black) ÷ (white − black)'],
-      ...raw.attributes.map((a): [string, string] => [a.name, a.display]),
-    ];
-    const n = rawNoise(raw);
-    if (raw.noise && n) {
-      rawInfo.splice(3, 0,
-        ['Read noise', `σ ${n.sigma.toFixed(2)} DN (${raw.noise.region} masked, ${raw.noise.pixels.toLocaleString()} px)`],
-        ['Engineering DR', `${n.dr.toFixed(2)} stops (${n.top === raw.white ? 'white' : 'linear max'} ÷ read noise)`],
-      );
-      if (Math.abs(raw.noise.offset) >= 1) rawInfo.splice(5, 0, ['Masked offset', `${raw.noise.offset > 0 ? '+' : ''}${raw.noise.offset.toFixed(1)} DN vs. declared black`]);
-    } else if (raw.kind === 'cfa') {
-      rawInfo.splice(3, 0, ['Read noise', 'no masked border in this file']);
-    }
-    if (raw.pattern !== 'demosaiced by LibRaw') rawInfo.splice(3, 0, ['Quantization', `${Math.log2(raw.white - greenBlack(raw)).toFixed(2)} stops from 1 DN to white`]);
-    rows.push('<h2>RAW</h2>', dl(rawInfo));
-    for (const n of raw.notes) rows.push(`<p class="note">${escapeHtml(n)}</p>`);
-    if (raw.kind === 'cfa' && raw.mode !== '709') rows.push('<p class="note">R/G/B statistics and histograms count photosites only; luminance uses the demosaiced image.</p>');
-  }
+  if (raw) rows.push(...rawInfo(raw));
   if (part?.chromaticities) {
     rows.push('<p class="note">Primaries are shown as raw RGB — no gamut conversion yet. Luminance uses the file\'s chromaticities.</p>');
   }
 
-  // Dynamic range.
+  // Dynamic range of luminance. RAW values are ratios to the white level, not DN.
   const L = img.histograms.L.stats;
   const cum = hist.cumFor('L')!;
+  const range = (lo: number, hi: number) => (raw ? `${fmtValue(2 ** lo)} … ${fmtValue(2 ** hi)} × white (${(hi - lo).toFixed(2)} stops)` : fmtRange(lo, hi));
   const drPairs: [string, string][] = [];
   if (L.pos) {
     const lo = Math.log2(L.minPos), hi = Math.log2(L.maxPos);
-    drPairs.push(['Full', fmtRange(lo, hi)]);
+    drPairs.push(['Full', range(lo, hi)]);
     for (const [a, b] of [[0.001, 0.999], [0.01, 0.99]]) {
       const pa = percentileEv(cum, a), pb = percentileEv(cum, b);
-      drPairs.push([`${a * 100}–${b * 100}%`, fmtRange(pa, pb)]);
+      drPairs.push([`${a * 100}–${b * 100}%`, range(pa, pb)]);
     }
-    drPairs.push(['Median', fmtLevel(percentileEv(cum, 0.5))]);
+    const med = percentileEv(cum, 0.5);
+    drPairs.push(['Median', raw ? `${fmtValue(2 ** med)} × white` : fmtLevel(med)]);
   }
-  rows.push('<h2>Luminance dynamic range</h2>', drPairs.length ? dl(drPairs) : '<p class="note">No positive values.</p>');
+  rows.push('<h2>Luminance (Y) dynamic range</h2>', drPairs.length ? dl(drPairs) : '<p class="note">No positive values.</p>');
   if (SHOW_STOPS && drPairs.length) rows.push('<p class="note">Stops are relative to 0.18 middle grey.</p>');
 
-  // Per-channel stats.
-  const keys: ChannelKey[] = img.luminanceOnly ? ['L'] : ['R', 'G', 'B', 'L'];
-  const stat = (f: (s: DecodedImage['histograms']['L']['stats']) => string) =>
-    keys.map((k) => {
-      total = totals[k] || img.width * img.height;
-      return `<td>${f(img.histograms[k].stats)}</td>`;
-    }).join('');
-  const totals = Object.fromEntries(keys.map((k) => {
-    const s = img.histograms[k].stats;
-    return [k, s.pos + s.zero + s.neg + s.nan + s.inf];
-  }));
-  let total = img.width * img.height;
-  const pct = (n: number) => (n ? (n / total < 0.0001 ? n.toString() : `${((n / total) * 100).toFixed(2)}%`) : '·');
-  rows.push(
-    '<h2>Channels</h2>',
-    `<table><tr><th></th>${keys.map((k) => `<th>${k}</th>`).join('')}</tr>` +
-      `<tr><td>max</td>${stat((s) => fmtLinear(s.maxPos))}</tr>` +
-      `<tr><td>min &gt; 0</td>${stat((s) => fmtLinear(s.minPos))}</tr>` +
-      `<tr><td>min</td>${stat((s) => (s.neg ? fmtLinear(s.minNeg) : s.zero ? fmtLinear(0) : fmtLinear(s.minPos)))}</tr>` +
-      `<tr><td>${raw ? 'at black' : 'zero'}</td>${stat((s) => pct(s.zero))}</tr>` +
-      `<tr><td>${raw ? 'below black' : 'negative'}</td>${stat((s) => pct(s.neg))}</tr>` +
-      `<tr><td>NaN</td>${stat((s) => pct(s.nan))}</tr>` +
-      `<tr><td>Inf</td>${stat((s) => pct(s.inf))}</tr></table>`,
-  );
+  if (raw) {
+    // Photosite statistics in raw integers, straight from the file.
+    const names = ['R', 'G', 'B'];
+    const cols = raw.dnStats.map((d, k) => ({ k, d })).filter((c) => c.d.count);
+    const pct = (n: number, t: number) => (n ? (n / t < 0.0001 ? n.toLocaleString() : `${((n / t) * 100).toFixed(2)}%`) : '·');
+    const row = (label: string, f: (d: RawImage['dnStats'][number]) => string, title = '') =>
+      `<tr title="${escapeHtml(title)}"><td>${label}</td>${cols.map((c) => `<td>${f(c.d)}</td>`).join('')}</tr>`;
+    rows.push(
+      `<h2>${raw.kind === 'cfa' ? 'Photosites' : 'Pixels'} (raw DN)</h2>`,
+      `<table><tr><th></th>${cols.map((c) => `<th class="k${names[c.k]}">${names[c.k]}</th>`).join('')}</tr>` +
+        row('max', (d) => String(d.max)) +
+        row('at max', (d) => pct(d.atMax, d.count), 'Share of photosites with exactly the maximum DN') +
+        row('min', (d) => String(d.min)) +
+        row('≤ black', (d) => pct(d.atOrBelowBlack, d.count), 'At or below the black level in use') +
+        row('count', (d) => d.count.toLocaleString()) +
+        '</table>',
+    );
+  } else {
+    const keys: ChannelKey[] = img.luminanceOnly ? ['L'] : ['R', 'G', 'B', 'L'];
+    const totals = Object.fromEntries(keys.map((k) => {
+      const s = img.histograms[k].stats;
+      return [k, s.pos + s.zero + s.neg + s.nan + s.inf];
+    }));
+    let total = img.width * img.height;
+    const stat = (f: (s: DecodedImage['histograms']['L']['stats']) => string) =>
+      keys.map((k) => {
+        total = totals[k] || img.width * img.height;
+        return `<td>${f(img.histograms[k].stats)}</td>`;
+      }).join('');
+    const pct = (n: number) => (n ? (n / total < 0.0001 ? n.toString() : `${((n / total) * 100).toFixed(2)}%`) : '·');
+    rows.push(
+      '<h2>Channels</h2>',
+      `<table><tr><th></th>${keys.map((k) => `<th>${k === 'L' ? 'Y' : k}</th>`).join('')}</tr>` +
+        `<tr><td>max</td>${stat((s) => fmtLinear(s.maxPos))}</tr>` +
+        `<tr><td>min &gt; 0</td>${stat((s) => fmtLinear(s.minPos))}</tr>` +
+        `<tr><td>min</td>${stat((s) => (s.neg ? fmtLinear(s.minNeg) : s.zero ? fmtLinear(0) : fmtLinear(s.minPos)))}</tr>` +
+        `<tr><td>zero</td>${stat((s) => pct(s.zero))}</tr>` +
+        `<tr><td>negative</td>${stat((s) => pct(s.neg))}</tr>` +
+        `<tr><td>NaN</td>${stat((s) => pct(s.nan))}</tr>` +
+        `<tr><td>Inf</td>${stat((s) => pct(s.inf))}</tr></table>`,
+    );
+  }
 
   if (part) {
     rows.push(
@@ -548,6 +574,91 @@ function renderInfo() {
   }
   el.innerHTML = rows.join('');
 }
+
+/** What the luminance coefficients are and which RGB they apply to. */
+function lumaSource(img: DecodedImage) {
+  const raw = img.raw;
+  if (raw) {
+    if (raw.mode === '709') return 'Rec.709 Y';
+    const on = raw.mode === 'cam' ? 'camera RGB without white balance' : 'white-balanced camera RGB';
+    return `Rec.709 Y after WB and LibRaw rgb_cam, applied to ${on} (negative weights and a sum ≠ 1 are expected there)`;
+  }
+  if (img.synthetic) return 'Rec.709 Y';
+  return img.parts[img.part]?.chromaticities ? 'Y row of RGB → XYZ from the file\'s chromaticities' : 'Rec.709 Y (the file has no chromaticities)';
+}
+
+/** The RAW sections of the info panel: sensor areas, levels with their sources, and processing. */
+function rawInfo(raw: RawImage): string[] {
+  const out: string[] = [];
+  const esc = escapeHtml;
+  const opt = (name: keyof RawOptions, items: { id: string; label: string }[], value: string) =>
+    items.length < 2
+      ? ''
+      : `<select data-opt="${name}">${items.map((i) => `<option value="${esc(i.id)}"${i.id === value ? ' selected' : ''}>${esc(i.label)}</option>`).join('')}</select>`;
+
+  // Metadata.
+  const meta: [string, string][] = raw.attributes.map((a) => [a.name, a.display]);
+  meta.push(['Sensor', `${raw.pattern}${raw.kind === 'cfa' ? ` (${raw.cellW}×${raw.cellH} cell)` : ''}`]);
+  out.push('<h2>RAW</h2>', dlHtml(meta.map(([k, v]) => [esc(k), esc(v)])));
+
+  // Sensor areas.
+  out.push('<h2>Sensor area</h2>', `<table class="src"><tr><th></th><th>size</th><th>origin</th></tr>${raw.areas
+    .map((a) => `<tr class="${a.id === raw.options.crop ? 'used' : ''}" title="${esc(a.source)}"><td>${esc(a.label)}</td><td>${a.w} × ${a.h}</td><td>${a.x}, ${a.y}</td></tr>`)
+    .join('')}</table>`);
+  const flipNote = raw.attributes.some((a) => a.name === 'Orientation') ? ' Sizes are in sensor orientation, before rotation.' : '';
+  out.push(`<p class="note">Full readout ${raw.rawSize[0]} × ${raw.rawSize[1]}. Hover a row for its source.${flipNote}</p>`);
+  const crop = opt('crop', raw.areas, raw.options.crop);
+  if (crop) out.push(`<label class="pick">Show ${crop}</label>`);
+
+  // Levels: every candidate, per CFA color, with the one in use highlighted.
+  const order = raw.cellColor.includes(3) ? [0, 1, 3, 2] : [0, 1, 2];
+  const names = ['R', 'G', 'B', 'G2'], cls = ['kR', 'kG', 'kB', 'kG'];
+  const lvl = (v: number | null) => (v === null ? '·' : fmtDnLevel(Math.round(v * 100) / 100));
+  const candRows = <T extends string>(list: LevelCandidate<T>[], used: T) =>
+    list.map((c) => `<tr class="${c.id === used ? 'used' : ''}" title="${esc(c.source)}"><td>${esc(c.label)}</td>${order.map((k) => `<td>${lvl(c.values[k])}</td>`).join('')}</tr>` +
+      (c.detail ? `<tr class="detail"><td></td>${order.map((k) => `<td>${esc(c.detail![k] ?? '')}</td>`).join('')}</tr>` : '')).join('');
+  out.push('<h2>Levels (DN)</h2>',
+    `<table class="src"><tr><th></th>${order.map((k) => `<th class="${cls[k]}">${names[k]}</th>`).join('')}</tr>` +
+      `<tr class="group"><td colspan="${order.length + 1}">Black</td></tr>${candRows(raw.blacks, raw.options.black)}` +
+      `<tr class="group"><td colspan="${order.length + 1}">White</td></tr>${candRows(raw.whites, raw.options.white)}</table>`);
+  const pickB = opt('black', raw.blacks, raw.options.black), pickW = opt('white', raw.whites, raw.options.white);
+  if (pickB || pickW) out.push(`<div class="pick">${pickB ? `<label>Black ${pickB}</label>` : ''}${pickW ? `<label>White ${pickW}</label>` : ''}</div>`);
+  out.push('<p class="note">Highlighted rows are applied. Hover a row for where the numbers come from.</p>');
+
+  // Processing.
+  const proc: [string, string][] = [];
+  const steps = ['value = (DN − black) ÷ (white − black)'];
+  if (raw.mode !== 'cam') steps.push('× WB');
+  if (raw.mode === '709') steps.push('demosaic, then × rgb_cam');
+  proc.push(['Readout', steps.join(', ')]);
+  const { range } = greenLevels(raw);
+  if (raw.pattern !== 'demosaiced by LibRaw') proc.push(['Quantization', `${Math.log2(range).toFixed(2)} stops from 1 DN to white (G)`]);
+  const n = rawNoise(raw);
+  if (raw.noise && n) {
+    proc.push(['Read noise', `σ ${n.sigma.toFixed(2)} DN (MAD of ${raw.noise.region}, ${raw.noise.pixels.toLocaleString()} px)`]);
+    proc.push(['Engineering DR', `${n.dr.toFixed(2)} stops (white − black) ÷ σ, G`]);
+  } else if (raw.kind === 'cfa') {
+    proc.push(['Read noise', 'no masked border in this file']);
+  }
+  proc.push(['White balance', `R ${raw.wb[0].toFixed(4)} · G 1 · B ${raw.wb[2].toFixed(4)} — ${raw.wbSource}, normalized to G`]);
+  proc.push(['rgb_cam', [0, 1, 2].map((i) => raw.rgbCam.slice(i * 3, i * 3 + 3).map((v) => v.toFixed(4)).join(' ')).join('  |  ') + ' — LibRaw: white-balanced camera RGB → linear sRGB/Rec.709 primaries, D65']);
+  proc.push(['Demosaic', raw.kind === 'cfa' ? 'bilinear (mean of same-color neighbors)' : 'none']);
+  out.push('<h2>Processing</h2>', dl2(proc));
+  for (const note of raw.notes) out.push(`<p class="note">${esc(note)}</p>`);
+  if (raw.kind === 'cfa' && raw.mode !== '709') out.push('<p class="note">Histogram R/G/B: exact photosite counts, one value per raw integer. Y: luminance of the demosaiced image, in 1/64-stop bins.</p>');
+  return out;
+}
+
+const dlHtml = (pairs: [string, string][]) => `<dl>${pairs.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>`;
+const dl2 = (pairs: [string, string][]) => dlHtml(pairs.map(([k, v]) => [escapeHtml(k), escapeHtml(v)]));
+
+// Level and area pickers in the info panel re-develop the RAW file.
+$('info').addEventListener('change', (e) => {
+  const sel = (e.target as HTMLElement).closest<HTMLSelectElement>('select[data-opt]');
+  if (!sel || !image?.raw) return;
+  rawOptions = { ...rawOptions, [sel.dataset.opt!]: sel.value };
+  reload?.(image.part, image.layer);
+});
 
 // ---------- controls ----------
 
@@ -565,6 +676,7 @@ function bindSeg(id: string, get: () => string, set: (v: string) => void) {
 
 const syncMode = bindSeg('mode', () => params.mode, (v) => (params.mode = v as DisplayMode));
 const syncY = bindSeg('yscale', () => hist.yScale, (v) => (hist.yScale = v as YScale));
+const syncX = bindSeg('xscale', () => hist.xScale, (v) => hist.setXScale(v as XScale));
 
 const histChannels = $('hist-channels');
 histChannels.addEventListener('click', (e) => {
@@ -575,6 +687,13 @@ histChannels.addEventListener('click', (e) => {
   else hist.channels.add(k);
   syncControls();
   hist.redraw();
+});
+
+const transferSel = $<HTMLSelectElement>('transfer');
+transferSel.innerHTML = TRANSFERS.map((t) => `<option value="${t.id}" title="${t.title}">${t.label}</option>`).join('');
+transferSel.addEventListener('change', () => {
+  params.transfer = transferSel.value as Transfer;
+  requestRender();
 });
 
 const colormapSel = $<HTMLSelectElement>('colormap');
@@ -638,10 +757,13 @@ $('layer').addEventListener('change', (e) => reload?.(image?.part ?? 0, (e.targe
 function syncControls() {
   syncMode();
   syncY();
+  syncX();
   histChannels.querySelectorAll('button').forEach((b) =>
     b.setAttribute('aria-pressed', String(hist.channels.has(b.dataset.v as ChannelKey))),
   );
   colormapSel.disabled = params.mode !== 'false';
+  transferSel.disabled = params.mode !== 'linear';
+  transferSel.value = params.transfer;
   $<HTMLInputElement>('bands').disabled = params.mode !== 'false';
   $<HTMLInputElement>('bands').checked = params.bands;
   $<HTMLInputElement>('clip').checked = params.clip;

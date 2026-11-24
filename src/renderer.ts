@@ -21,6 +21,7 @@ uniform float u_scale;     // device px per image px
 uniform float u_canvasH;
 uniform float u_lo, u_hi;  // window, log2 of value
 uniform int u_mode;        // 0 log, 1 linear, 2 false color
+uniform int u_transfer;    // linear mode encoding: 0 sRGB, 1 BT.1886 (1/2.4), 2 1/2.2, 3 none
 uniform int u_channel;     // 0 rgb, 1 r, 2 g, 3 b, 4 luminance, 5 alpha
 uniform bool u_clip, u_isolate, u_bands;
 uniform vec2 u_hover;      // log2 range highlighted from the histogram; x > y means off
@@ -57,7 +58,15 @@ float windowT(float v) {
   return (ev - u_lo) / (u_hi - u_lo);
 }
 
-float toDisplay(float t) { return u_mode == 1 ? srgb(t) : clamp(t, 0.0, 1.0); }
+float encode(float x) {
+  x = clamp(x, 0.0, 1.0);
+  if (u_transfer == 0) return srgb(x);
+  if (u_transfer == 1) return pow(x, 1.0 / 2.4);
+  if (u_transfer == 2) return pow(x, 1.0 / 2.2);
+  return x;
+}
+
+float toDisplay(float t) { return u_mode == 1 ? encode(t) : clamp(t, 0.0, 1.0); }
 
 void main() {
   vec2 frag = vec2(gl_FragCoord.x, u_canvasH - gl_FragCoord.y);
@@ -153,6 +162,7 @@ void main() {
 }`;
 
 const MODE = { log: 0, linear: 1, false: 2 } as const;
+const TRANSFER = { srgb: 0, bt1886: 1, g22: 2, none: 3 } as const;
 const CHANNEL = { rgb: 0, r: 1, g: 2, b: 3, l: 4, a: 5 } as const;
 
 export interface ViewTransform {
@@ -258,6 +268,7 @@ export class Renderer {
     gl.uniform1f(this.u('u_lo'), p.lo);
     gl.uniform1f(this.u('u_hi'), Math.max(p.hi, p.lo + 1e-4));
     gl.uniform1i(this.u('u_mode'), MODE[p.mode]);
+    gl.uniform1i(this.u('u_transfer'), TRANSFER[p.transfer]);
     gl.uniform1i(this.u('u_channel'), CHANNEL[p.channel]);
     gl.uniform1i(this.u('u_clip'), p.clip ? 1 : 0);
     gl.uniform1i(this.u('u_isolate'), p.isolate ? 1 : 0);
