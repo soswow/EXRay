@@ -361,14 +361,14 @@ function rawProbe(probe: HTMLElement, raw: RawImage, x: number, y: number, R: nu
   if (mosaic) {
     const dn = raw.dn[y * w + x];
     const v = (dn - raw.cellBlack[cell]) * raw.cellScale[cell];
-    lines.push(`<span class="ev">${names[site]} photosite</span>`, header('DN'));
+    lines.push(`<span class="ev">${names[site].padEnd(2)} photosite</span>`, header('DN'));
     lines.push(row(names[site], names[siteChannel], String(dn), v));
     probe.innerHTML = lines.join('\n');
     probe.hidden = false;
     hist.setProbe({ [names[siteChannel]]: v });
     return;
   }
-  lines.push(`<span class="ev">demosaiced${site >= 0 ? ` · ${names[site]} photosite •` : ''}</span>`, header(approx ? 'DN≈' : 'DN'));
+  lines.push(`<span class="ev">demosaiced${site >= 0 ? ` · ${names[site].padEnd(2)} photosite •` : ''}</span>`, header(approx ? 'DN≈' : 'DN'));
   [R, G, B].forEach((v, c) => {
     // The photosite's own channel is the exact raw integer; the others are interpolated.
     const exact = c === siteChannel && !approx;
