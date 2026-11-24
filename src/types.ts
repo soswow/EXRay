@@ -87,6 +87,54 @@ export interface DecodedImage {
   histograms: Record<ChannelKey, ChannelHistogram>;
   timings: { decodeMs: number; histMs: number };
   synthetic?: boolean;
+  /** Present for camera RAW files. `data` then holds the demosaiced, normalized image. */
+  raw?: RawImage;
+}
+
+/** How a RAW file's sensor values are turned into RGB. */
+export type RawModeId = 'cam' | 'wb' | '709';
+export const RAW_MODES: { id: RawModeId; label: string }[] = [
+  { id: 'cam', label: 'Camera RGB' },
+  { id: 'wb', label: 'Camera RGB · white balanced' },
+  { id: '709', label: 'Linear Rec.709 (WB + matrix)' },
+];
+
+export interface RawImage {
+  mode: RawModeId;
+  /**
+   * 'cfa': mosaic sensor data, one value per photosite.
+   * 'linear': already demosaiced in the file (linear DNG, sRAW) or by LibRaw (unusual layouts).
+   */
+  kind: 'cfa' | 'linear';
+  /** Raw integer values of the visible area, rows top-down; 1 value per pixel for 'cfa', 3 for 'linear'. */
+  dn: Uint16Array;
+  channels: 1 | 3;
+  /**
+   * The CFA pattern as a repeating cell of `cellW` × `cellH` photosites, anchored at the top-left
+   * visible pixel. Per cell: color (0 R, 1 G, 2 B, 3 second G), black level, and the factor that
+   * turns (DN − black) into the displayed value (normalization and, in WB modes, white balance).
+   * For 'linear' there is one cell per channel.
+   */
+  cellW: number;
+  cellH: number;
+  cellColor: number[];
+  cellBlack: number[];
+  cellScale: number[];
+  /** White level used for normalization: 1.0 in the display means this DN (after black). */
+  white: number;
+  /** Highest value the camera considers linear, if the file says so (0 when unknown). */
+  linearMax: number;
+  /** Bits per sample implied by the white level. */
+  bits: number;
+  /** Short pattern name, e.g. "RGGB", "X-Trans". */
+  pattern: string;
+  make: string;
+  model: string;
+  /** EXIF-like metadata for the info panel. */
+  attributes: ExrAttribute[];
+  notes: string[];
+  /** LibRaw unpack (0 when reused from the previous decode) and our own processing. */
+  timings: { unpackMs: number; developMs: number };
 }
 
 export type WorkerRequest =

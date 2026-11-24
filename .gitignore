@@ -4,3 +4,5 @@ dist
 # local symlink to sample images, not part of the repo
 samples
 .claude/settings.local.json
+# local symlinks to RAW sample files
+raw-samples

@@ -4,7 +4,8 @@ import { lumaWeights, parseExrLayout, pixelTypeName, remapLayer } from './exr-he
 import { canDecodeNatively, decodeNative } from './exr-decode';
 import { HistogramAccumulator } from './histogram';
 import { makeDemoImage } from './demo';
-import type { ChannelHistogram, ChannelKey, DecodedImage, ExrPart, WorkerRequest, WorkerResponse } from './types';
+import { decodeRaw, isExr } from './raw-decode';
+import type { ChannelHistogram, ChannelKey, DecodedImage, ExrPart, RawModeId, WorkerRequest, WorkerResponse } from './types';
 
 // Typed view of the worker global, without pulling the WebWorker lib into the DOM build.
 const ctx = self as unknown as {
@@ -17,6 +18,7 @@ ctx.onmessage = async (e) => {
     const req = e.data;
     const image = req.type === 'demo' ? demo() : await decode(req.buffer, req.name, req.part, req.layer);
     const transfer: Transferable[] = [image.data.buffer];
+    if (image.raw) transfer.push(image.raw.dn.buffer);
     for (const k of Object.keys(image.histograms) as ChannelKey[]) transfer.push(image.histograms[k].bins.buffer);
     ctx.postMessage({ type: 'result', image }, transfer);
   } catch (err) {
@@ -25,6 +27,7 @@ ctx.onmessage = async (e) => {
 };
 
 async function decode(buffer: ArrayBuffer, name: string, part: number, layerId?: string): Promise<DecodedImage> {
+  if (!isExr(buffer)) return decodeRawImage(buffer, name, (layerId as RawModeId | undefined) ?? 'cam');
   const layout = parseExrLayout(buffer);
   const parts = layout.parts;
   const header: ExrPart | undefined = parts[part];
@@ -88,6 +91,30 @@ async function decode(buffer: ArrayBuffer, name: string, part: number, layerId?:
   };
 }
 
+async function decodeRawImage(buffer: ArrayBuffer, name: string, mode: RawModeId): Promise<DecodedImage> {
+  const t0 = performance.now();
+  const r = await decodeRaw(buffer, name, mode);
+  const t1 = performance.now();
+  const histograms = buildHistograms(r.data, r.width * r.height, r.lumaWeights, r.photositeHistograms);
+  const t2 = performance.now();
+  return {
+    name,
+    byteSize: buffer.byteLength,
+    width: r.width,
+    height: r.height,
+    data: r.data,
+    hasAlpha: false,
+    luminanceOnly: false,
+    part: 0,
+    layer: mode,
+    parts: [],
+    lumaWeights: r.lumaWeights,
+    histograms,
+    timings: { decodeMs: t1 - t0, histMs: t2 - t1 },
+    raw: r.raw,
+  };
+}
+
 function demo(): DecodedImage {
   const width = 1920, height = 1080;
   const t0 = performance.now();
@@ -114,17 +141,23 @@ function demo(): DecodedImage {
   };
 }
 
-/** Histograms for R, G, B and luminance. Luminance is computed in chunks to bound memory. */
+/**
+ * Histograms for R, G, B and luminance. Luminance is computed in chunks to bound memory.
+ * `rgb` supplies ready-made R/G/B histograms (RAW photosites) instead of reading them from `data`.
+ */
 function buildHistograms(
   data: Float32Array,
   pixels: number,
   w: [number, number, number],
+  rgb?: { R: ChannelHistogram; G: ChannelHistogram; B: ChannelHistogram },
 ): Record<ChannelKey, ChannelHistogram> {
   const u32 = new Uint32Array(data.buffer, data.byteOffset, data.length);
   const acc = { R: new HistogramAccumulator(), G: new HistogramAccumulator(), B: new HistogramAccumulator(), L: new HistogramAccumulator() };
-  acc.R.add(data, u32, 0, 4, pixels);
-  acc.G.add(data, u32, 1, 4, pixels);
-  acc.B.add(data, u32, 2, 4, pixels);
+  if (!rgb) {
+    acc.R.add(data, u32, 0, 4, pixels);
+    acc.G.add(data, u32, 1, 4, pixels);
+    acc.B.add(data, u32, 2, 4, pixels);
+  }
 
   const CHUNK = 1 << 16;
   const lum = new Float32Array(CHUNK);
@@ -137,5 +170,5 @@ function buildHistograms(
     }
     acc.L.add(lum, lumBits, 0, 1, n);
   }
-  return { R: acc.R.result(), G: acc.G.result(), B: acc.B.result(), L: acc.L.result() };
+  return rgb ? { ...rgb, L: acc.L.result() } : { R: acc.R.result(), G: acc.G.result(), B: acc.B.result(), L: acc.L.result() };
 }

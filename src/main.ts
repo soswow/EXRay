@@ -6,7 +6,7 @@ import { fmtBytes, fmtEv, fmtValue, escapeHtml } from './format';
 import { percentileEv } from './histogram';
 import { HistogramView, type YScale } from './histogram-view';
 import { Renderer } from './renderer';
-import type { ChannelKey, DecodedImage, WorkerRequest, WorkerResponse } from './types';
+import { RAW_MODES, type ChannelKey, type DecodedImage, type RawImage, type WorkerRequest, type WorkerResponse } from './types';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -29,6 +29,12 @@ let reload: ((part: number, layer?: string) => Promise<void>) | null = null;
 /** CSS px per image px, and CSS px offset of the image's top-left corner. */
 const view = { scale: 1, x: 0, y: 0 };
 let hover: [number, number] | null = null;
+/** RAW sensor view: the mosaic of photosites, the demosaiced image, or the mosaic once zoomed in. */
+type SensorView = 'auto' | 'demosaic' | 'mosaic';
+let sensorView: SensorView = 'auto';
+/** CSS px per photosite at which 'auto' switches to the mosaic. */
+const MOSAIC_ZOOM = 4;
+const mosaicShown = () => !!image?.raw && image.raw.kind === 'cfa' && (sensorView === 'mosaic' || (sensorView === 'auto' && view.scale >= MOSAIC_ZOOM));
 
 // ---------- components ----------
 
@@ -84,8 +90,10 @@ function render() {
     params,
     hover,
     image.lumaWeights,
+    mosaicShown(),
   );
-  $('zoom-label').textContent = `${view.scale >= 1 ? Math.round(view.scale * 100) : (view.scale * 100).toFixed(1)}%  ·  ${image.width}×${image.height}`;
+  const raw = image.raw?.kind === 'cfa' ? `  ·  ${mosaicShown() ? `mosaic (${image.raw.pattern})` : 'demosaiced'}` : '';
+  $('zoom-label').textContent = `${view.scale >= 1 ? Math.round(view.scale * 100) : (view.scale * 100).toFixed(1)}%  ·  ${image.width}×${image.height}${raw}`;
 }
 
 new ResizeObserver(() => requestRender()).observe(viewport);
@@ -160,6 +168,7 @@ function loadUrl(url: string) {
 function setImage(img: DecodedImage, keepView: boolean) {
   try {
     renderer.setImage(img.width, img.height, img.data);
+    renderer.setMosaic(img.raw?.kind === 'cfa' ? mosaicTable(img.width, img.height, img.raw) : null);
   } catch (e) {
     showError(e instanceof Error ? e.message : String(e));
     return;
@@ -178,7 +187,8 @@ function setImage(img: DecodedImage, keepView: boolean) {
     .join('');
   partSel.value = String(img.part);
 
-  const layers = img.parts[img.part]?.layers ?? [];
+  const layers = img.raw ? RAW_MODES : img.parts[img.part]?.layers ?? [];
+  $('sensor').hidden = img.raw?.kind !== 'cfa';
   const layerSel = $<HTMLSelectElement>('layer');
   layerSel.hidden = layers.length < 2;
   layerSel.innerHTML = layers.map((l) => `<option value="${escapeHtml(l.id)}">${escapeHtml(l.label)}</option>`).join('');
@@ -302,6 +312,8 @@ function updateProbe(e: PointerEvent) {
   const [R, G, B, A] = [d[i], d[i + 1], d[i + 2], d[i + 3]];
   const w = image.lumaWeights;
   const L = w[0] * R + w[1] * G + w[2] * B;
+  const raw = image.raw;
+  if (raw) return rawProbe(probe, raw, x, y, R, G, B, L);
   const ev = (v: number) => (v > 0 && Number.isFinite(v) ? fmtEv(Math.log2(v), 2).padStart(7) : '      ·');
   const row = (k: string, v: number) =>
     `<span class="k${k}">${k}</span> ${fmtValue(v).padStart(10)}  <span class="ev">${ev(v)} EV</span>`;
@@ -312,6 +324,58 @@ function updateProbe(e: PointerEvent) {
   probe.innerHTML = lines.join('\n');
   probe.hidden = false;
   hist.setProbe(image.luminanceOnly ? { L: R } : { R, G, B, L });
+}
+
+function rawProbe(probe: HTMLElement, raw: RawImage, x: number, y: number, R: number, G: number, B: number, L: number) {
+  const ev = (v: number) => (v > 0 && Number.isFinite(v) ? fmtEv(Math.log2(v), 2).padStart(7) : '      ·');
+  const row = (k: string, v: number, cls = k) =>
+    `<span class="k${cls}">${k.padEnd(2)}</span> ${fmtValue(v).padStart(10)}  <span class="ev">${ev(v)} EV</span>`;
+  const lines = [`x ${x}  y ${y}`];
+  const names = ['R', 'G', 'B', 'G2'];
+  const w = image!.width;
+  // Raw integers at this pixel: one photosite for a mosaic, three values for linear files.
+  const sites: { k: number; cell: number; dn: number }[] = [];
+  if (raw.kind === 'cfa') {
+    const cell = (y % raw.cellH) * raw.cellW + (x % raw.cellW);
+    sites.push({ k: raw.cellColor[cell], cell, dn: raw.dn[y * w + x] });
+  } else {
+    for (let c = 0; c < 3; c++) sites.push({ k: c, cell: c, dn: raw.dn[(y * w + x) * 3 + c] });
+  }
+  for (const s of sites) {
+    const black = raw.cellBlack[s.cell];
+    const rel = (s.dn - black) / (raw.white - black);
+    const cls = names[s.k === 3 ? 1 : s.k];
+    lines.push(
+      `<span class="k${cls}">${names[s.k].padEnd(2)}</span> <b>${String(s.dn).padStart(5)}</b> DN  ` +
+        `<span class="ev">−${fmtValue(black)} → ${String(s.dn - black).padStart(5)}  ·  ${(rel * 100).toFixed(2).padStart(6)}% of ${raw.white - black}</span>`,
+    );
+  }
+  const mosaic = mosaicShown();
+  lines.push(mosaic ? '<span class="ev">photosite value</span>' : '<span class="ev">demosaiced</span>');
+  if (mosaic) {
+    const s = sites[0], cls = names[s.k === 3 ? 1 : s.k];
+    const v = (s.dn - raw.cellBlack[s.cell]) * raw.cellScale[s.cell];
+    lines.push(row(cls, v));
+    probe.innerHTML = lines.join('\n');
+    probe.hidden = false;
+    hist.setProbe({ [cls]: v });
+    return;
+  }
+  lines.push(row('R', R), row('G', G), row('B', B), row('L', L));
+  probe.innerHTML = lines.join('\n');
+  probe.hidden = false;
+  hist.setProbe({ R, G, B, L });
+}
+
+/** Per-cell RGBA table for the mosaic shader: color index, black level, scale. */
+function mosaicTable(width: number, height: number, raw: RawImage) {
+  const cell = new Float32Array(raw.cellW * raw.cellH * 4);
+  for (let i = 0; i < raw.cellW * raw.cellH; i++) {
+    cell[i * 4] = raw.cellColor[i];
+    cell[i * 4 + 1] = raw.cellBlack[i];
+    cell[i * 4 + 2] = raw.cellScale[i];
+  }
+  return { width, height, dn: raw.dn, cellW: raw.cellW, cellH: raw.cellH, cell };
 }
 
 // ---------- info panel ----------
@@ -344,7 +408,22 @@ function renderInfo() {
   }
   fileInfo.push(['Luma weights', img.lumaWeights.map((v) => v.toFixed(4)).join(', ')]);
   fileInfo.push(['Decode', `${img.timings.decodeMs.toFixed(0)} ms · histogram ${img.timings.histMs.toFixed(0)} ms`]);
+  if (img.raw) fileInfo.push(['RAW timing', `LibRaw ${img.raw.timings.unpackMs ? `${img.raw.timings.unpackMs.toFixed(0)} ms` : 'cached'} · develop ${img.raw.timings.developMs.toFixed(0)} ms`]);
   rows.push('<h2>Image</h2>', dl(fileInfo));
+  const raw = img.raw;
+  if (raw) {
+    const blacks = [...new Set(raw.cellBlack)].map((b) => fmtValue(b)).join(' / ');
+    const rawInfo: [string, string][] = [
+      ['Sensor', `${raw.pattern}${raw.kind === 'cfa' ? ` (${raw.cellW}×${raw.cellH} cell)` : ''}`],
+      ['Black level', blacks],
+      ['White level', `${raw.white} (${raw.bits}-bit)${raw.linearMax && raw.linearMax !== raw.white ? ` · linear max ${raw.linearMax}` : ''}`],
+      ['Normalized', '1.0 = white level, after black subtraction'],
+      ...raw.attributes.map((a): [string, string] => [a.name, a.display]),
+    ];
+    rows.push('<h2>RAW</h2>', dl(rawInfo));
+    for (const n of raw.notes) rows.push(`<p class="note">${escapeHtml(n)}</p>`);
+    if (raw.kind === 'cfa' && raw.mode !== '709') rows.push('<p class="note">R/G/B statistics and histograms count photosites only; luminance uses the demosaiced image.</p>');
+  }
   if (part?.chromaticities) {
     rows.push('<p class="note">Primaries are shown as raw RGB — no gamut conversion yet. Luminance uses the file\'s chromaticities.</p>');
   }
@@ -367,8 +446,15 @@ function renderInfo() {
   // Per-channel stats.
   const keys: ChannelKey[] = img.luminanceOnly ? ['L'] : ['R', 'G', 'B', 'L'];
   const stat = (f: (s: DecodedImage['histograms']['L']['stats']) => string) =>
-    keys.map((k) => `<td>${f(img.histograms[k].stats)}</td>`).join('');
-  const total = img.width * img.height;
+    keys.map((k) => {
+      total = totals[k] || img.width * img.height;
+      return `<td>${f(img.histograms[k].stats)}</td>`;
+    }).join('');
+  const totals = Object.fromEntries(keys.map((k) => {
+    const s = img.histograms[k].stats;
+    return [k, s.pos + s.zero + s.neg + s.nan + s.inf];
+  }));
+  let total = img.width * img.height;
   const pct = (n: number) => (n ? (n / total < 0.0001 ? n.toString() : `${((n / total) * 100).toFixed(2)}%`) : '·');
   rows.push(
     '<h2>Channels</h2>',
@@ -429,6 +515,11 @@ colormapSel.addEventListener('change', () => {
   renderer.setLut(colormapLut(params.colormap));
   requestRender();
 });
+const sensorSel = $<HTMLSelectElement>('sensor');
+sensorSel.addEventListener('change', () => {
+  sensorView = sensorSel.value as SensorView;
+  requestRender();
+});
 const channelSel = $<HTMLSelectElement>('channel');
 channelSel.addEventListener('change', () => {
   params.channel = channelSel.value as ViewChannel;
@@ -472,6 +563,7 @@ function syncControls() {
   $<HTMLInputElement>('clip').checked = params.clip;
   $<HTMLInputElement>('isolate').checked = params.isolate;
   channelSel.value = params.channel;
+  sensorSel.value = sensorView;
   if (document.activeElement !== winLo) winLo.value = params.lo.toFixed(2);
   if (document.activeElement !== winHi) winHi.value = params.hi.toFixed(2);
   document.querySelector('.legend')!.classList.toggle('off', !params.clip);
@@ -548,6 +640,11 @@ window.addEventListener('keydown', (e) => {
     f: fitImage,
     h: () => hist.fitView(),
     o: openPicker,
+    m: () => {
+      if (!image?.raw || image.raw.kind !== 'cfa') return;
+      const order: SensorView[] = ['auto', 'mosaic', 'demosaic'];
+      sensorView = order[(order.indexOf(sensorView) + 1) % order.length];
+    },
     '0': () => image && zoomAt(viewport.clientWidth / 2, viewport.clientHeight / 2, 1 / (window.devicePixelRatio || 1)),
     '[': () => { params.lo -= 0.5; params.hi -= 0.5; },
     ']': () => { params.lo += 0.5; params.hi += 0.5; },

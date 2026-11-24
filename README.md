@@ -18,6 +18,11 @@ Explore the full dynamic range of HDR OpenEXR images — entirely in the browser
 - **Multi-part files and layers/AOVs.** For example `diffuse.RGB`, `Z`, or `disparityL.x`.
 - **Color-accurate luminance.** Luminance weights come from the file's `chromaticities`.
 - **Header viewer.** Lists every header attribute.
+- **Camera RAW files** (CR2/CR3, NEF, ARW, DNG, RAF, ORF, RW2, PEF, X3F, …), unpacked by [LibRaw](https://www.libraw.org/) compiled to WebAssembly and loaded only when a RAW file is opened.
+  - Values are normalized so 1.0 is the white level after black subtraction, so the histogram shows the headroom below sensor saturation.
+  - Zoom in (or press `M`) to see the **mosaic**: every photosite in its own color with its true value, no interpolation. Zoomed out, a bilinear demosaic is shown.
+  - The pixel probe shows the raw integer (DN), the black level, and the value relative to the white level.
+  - Three ways to turn sensor values into RGB: camera RGB, white-balanced camera RGB, or linear Rec.709 through the camera matrix. R/G/B histograms count real photosites only.
 
 ## Usage
 
@@ -44,6 +49,7 @@ For local testing, symlink a folder of EXRs as `samples/` in the project root (i
 | `F` / `0` | Fit image / 1:1 pixels |
 | `H` | Fit histogram (press again to show everything) |
 | `O` | Open file |
+| `M` | RAW: mosaic when zoomed in / always / never |
 
 In the image, the wheel zooms, dragging pans, and double-clicking fits. In the histogram, the wheel zooms, dragging pans, and double-clicking fits.
 
@@ -70,4 +76,4 @@ In the image, the wheel zooms, dragging pans, and double-clicking fits. In the h
 
 ## License
 
-[GPL-3.0](LICENSE). The bundled three.js `EXRLoader` is MIT-licensed and includes code derived from OpenEXR (BSD-3-Clause).
+[GPL-3.0](LICENSE). The bundled three.js `EXRLoader` is MIT-licensed and includes code derived from OpenEXR (BSD-3-Clause). RAW support uses [LibRaw](https://www.libraw.org/) (LGPL-2.1 / CDDL-1.0) via the MIT-licensed [`@colorhythm/libraw-wasm`](https://github.com/colorhythm/libraw-wasm) bindings.

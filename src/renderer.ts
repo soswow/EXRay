@@ -25,6 +25,12 @@ uniform bool u_clip, u_isolate, u_bands;
 uniform vec2 u_hover;      // EV range highlighted from the histogram; x > y means off
 uniform vec3 u_weights;
 
+// Mosaic view of RAW sensor data: one value per photosite, shown in its own color.
+uniform bool u_mosaic;
+uniform highp usampler2D u_cfa; // R16UI raw integers, rows top-down
+uniform sampler2D u_cell;       // RGBA32F per CFA cell: color index, black level, scale
+uniform ivec2 u_period;
+
 uniform vec3 c_under, c_over, c_nan, c_neg, c_hover;
 
 out vec4 outColor;
@@ -63,11 +69,35 @@ void main() {
   }
 
   ivec2 tc = ivec2(int(ip.x), int(u_size.y) - 1 - int(ip.y));
-  vec4 px = texelFetch(u_img, tc, 0);
+  vec4 px;
+  int site = -1;
+  float siteValue = 0.0;
+  if (u_mosaic) {
+    ivec2 p = ivec2(ip);
+    vec4 cell = texelFetch(u_cell, p % u_period, 0);
+    siteValue = (float(texelFetch(u_cfa, p, 0).r) - cell.g) * cell.b;
+    site = min(int(cell.r + 0.5), 3);
+    if (site == 3) site = 1;
+    px = vec4(0.0, 0.0, 0.0, 1.0);
+    px[site] = siteValue;
+    if (u_channel >= 1 && u_channel <= 3 && site != u_channel - 1) {
+      // A photosite of another color: there is no value for this channel here.
+      vec3 c = vec3(0.045);
+      if (u_scale >= 16.0) {
+        vec2 f = fract(ip) * u_scale;
+        if (f.x < 1.0 || f.y < 1.0) c = mix(c, vec3(0.5), 0.25);
+      }
+      outColor = vec4(c, 1.0);
+      return;
+    }
+  } else {
+    px = texelFetch(u_img, tc, 0);
+  }
 
   // The scalar that drives clipping, isolation and hover tests.
   float v;
-  if (u_channel == 1) v = px.r;
+  if (site >= 0) v = siteValue;
+  else if (u_channel == 1) v = px.r;
   else if (u_channel == 2) v = px.g;
   else if (u_channel == 3) v = px.b;
   else if (u_channel == 5) v = px.a;
@@ -136,6 +166,9 @@ export class Renderer {
   private imgTex: WebGLTexture;
   private lutTex: WebGLTexture;
   private uniforms = new Map<string, WebGLUniformLocation | null>();
+  private cfaTex: WebGLTexture;
+  private cellTex: WebGLTexture;
+  private period: [number, number] = [0, 0];
   private size: [number, number] = [0, 0];
   readonly maxTextureSize: number;
 
@@ -147,6 +180,11 @@ export class Renderer {
     this.program = link(gl, VERT, FRAG);
     this.imgTex = makeTexture(gl);
     this.lutTex = makeTexture(gl, gl.LINEAR);
+    // Placeholders, so the integer sampler always has a matching texture bound.
+    this.cfaTex = makeTexture(gl);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16UI, 1, 1, 0, gl.RED_INTEGER, gl.UNSIGNED_SHORT, new Uint16Array(1));
+    this.cellTex = makeTexture(gl);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 1, 1, 0, gl.RGBA, gl.FLOAT, new Float32Array(4));
     gl.bindVertexArray(gl.createVertexArray());
   }
 
@@ -166,13 +204,30 @@ export class Renderer {
     this.size = [width, height];
   }
 
+  /** Raw CFA integers (rows top-down) and the per-cell table, for the mosaic view. Null clears it. */
+  setMosaic(m: { width: number; height: number; dn: Uint16Array; cellW: number; cellH: number; cell: Float32Array } | null) {
+    const gl = this.gl;
+    this.period = m ? [m.cellW, m.cellH] : [0, 0];
+    if (!m) return;
+    gl.bindTexture(gl.TEXTURE_2D, this.cfaTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16UI, m.width, m.height, 0, gl.RED_INTEGER, gl.UNSIGNED_SHORT, m.dn);
+    gl.bindTexture(gl.TEXTURE_2D, this.cellTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, m.cellW, m.cellH, 0, gl.RGBA, gl.FLOAT, m.cell);
+  }
+
+  get hasMosaic() {
+    return this.period[0] > 0;
+  }
+
   setLut(lut: Uint8Array) {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lut);
   }
 
-  render(view: ViewTransform, p: DisplayParams, hover: [number, number] | null, weights: [number, number, number]) {
+  render(view: ViewTransform, p: DisplayParams, hover: [number, number] | null, weights: [number, number, number], mosaic = false) {
     const gl = this.gl;
     const { width, height } = this.canvas;
     gl.viewport(0, 0, width, height);
@@ -183,6 +238,15 @@ export class Renderer {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
     gl.uniform1i(this.u('u_lut'), 1);
+    const useMosaic = mosaic && this.hasMosaic;
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.cfaTex);
+    gl.uniform1i(this.u('u_cfa'), 2);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, this.cellTex);
+    gl.uniform1i(this.u('u_cell'), 3);
+    gl.uniform1i(this.u('u_mosaic'), useMosaic ? 1 : 0);
+    gl.uniform2i(this.u('u_period'), Math.max(1, this.period[0]), Math.max(1, this.period[1]));
 
     gl.uniform2f(this.u('u_size'), this.size[0], this.size[1]);
     gl.uniform2f(this.u('u_offset'), view.offsetX, view.offsetY);
